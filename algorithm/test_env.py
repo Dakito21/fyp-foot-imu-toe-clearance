@@ -1,0 +1,2 @@
+from gaitmap_datasets.sensor_position_comparison_2019 import SensorPositionComparison2019Mocap
+print("Environment OK")
