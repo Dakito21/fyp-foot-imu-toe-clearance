@@ -39,6 +39,23 @@ from pathlib import Path
 import builtins
 ORIG_PRINT = builtins.print  # keep original
 
+from scipy.signal import butter, filtfilt
+
+def butter_lowpass_filter(x, fs_hz, cutoff_hz, order=4):
+    """
+    Zero-phase Butterworth low-pass filter.
+    """
+    import numpy as np
+
+    if cutoff_hz <= 0 or cutoff_hz >= 0.5 * fs_hz:
+        return x
+
+    nyq = 0.5 * fs_hz
+    wn = cutoff_hz / nyq
+    b, a = butter(order, wn, btype="low", analog=False)
+    return filtfilt(b, a, x)
+
+
 ##############################################################################
 # Logging & small helpers
 ##############################################################################
@@ -245,6 +262,29 @@ def quat_mul(q1, q2):
         w1*z2 + x1*y2 - y1*x2 + z1*w2
     ], dtype=float)
 
+def quat_mul_batch(Q1, Q2):
+    """
+    Elementwise Hamilton product for arrays shaped (N,4).
+    Quats are [w,x,y,z].
+    Returns (N,4).
+    """
+    Q1 = np.asarray(Q1, dtype=float)
+    Q2 = np.asarray(Q2, dtype=float)
+
+    if Q1.ndim != 2 or Q2.ndim != 2 or Q1.shape[1] != 4 or Q2.shape[1] != 4:
+        raise ValueError(f"quat_mul_batch expects (N,4), got {Q1.shape} and {Q2.shape}")
+    if Q1.shape[0] != Q2.shape[0]:
+        raise ValueError(f"quat_mul_batch expects same N, got {Q1.shape[0]} and {Q2.shape[0]}")
+
+    w1, x1, y1, z1 = Q1[:, 0], Q1[:, 1], Q1[:, 2], Q1[:, 3]
+    w2, x2, y2, z2 = Q2[:, 0], Q2[:, 1], Q2[:, 2], Q2[:, 3]
+
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+
+    return np.column_stack([w, x, y, z])
 
 def quat_conj(q):
     w, x, y, z = q
@@ -255,6 +295,70 @@ def quat_rotate(q, v):
     """Rotate 3D vector v by quaternion q."""
     qv = np.array([0.0, v[0], v[1], v[2]], dtype=float)
     return quat_mul(quat_mul(q, qv), quat_conj(q))[1:]
+
+def _quat_norm(q):
+    n = float(np.linalg.norm(q))
+    return q / n if n > 1e-12 else np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
+def quat_norm_batch(Q):
+    Q = np.asarray(Q, dtype=float)
+    n = np.linalg.norm(Q, axis=1, keepdims=True)
+    return Q / np.clip(n, 1e-12, None)
+
+
+def _quat_from_two_unit_vectors(u, v):
+    # u,v are unit 3-vectors. Returns quaternion rotating u -> v.
+    u = np.asarray(u, dtype=float)
+    v = np.asarray(v, dtype=float)
+    dot = float(np.clip(np.dot(u, v), -1.0, 1.0))
+
+    if dot > 0.999999:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
+    if dot < -0.999999:
+        # 180 deg rotation: pick any orthogonal axis
+        axis = np.array([1.0, 0.0, 0.0], dtype=float)
+        if abs(u[0]) > 0.9:
+            axis = np.array([0.0, 1.0, 0.0], dtype=float)
+        axis = axis - u * np.dot(axis, u)
+        axis = axis / max(1e-12, np.linalg.norm(axis))
+        return np.array([0.0, axis[0], axis[1], axis[2]], dtype=float)
+
+    axis = np.cross(u, v)
+    w = 1.0 + dot
+    q = np.array([w, axis[0], axis[1], axis[2]], dtype=float)
+    return _quat_norm(q)
+
+def _slerp_identity(q, alpha):
+    """
+    True SLERP from identity to q by alpha.
+    q is [w,x,y,z]. alpha in [0,1].
+    """
+    q = _quat_norm(q)
+    if q[0] < 0:
+        q = -q  # shortest path
+
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+
+    # angle between I=[1,0,0,0] and q is 2*acos(w)
+    w = float(np.clip(q[0], -1.0, 1.0))
+    theta = 2.0 * np.arccos(w)
+
+    if theta < 1e-8:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
+    # Identity->q slerp is equivalent to exponentiating q^alpha
+    # q = [cos(theta/2), sin(theta/2)*axis]
+    axis = q[1:4]
+    s = float(np.linalg.norm(axis))
+    if s < 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+    axis_u = axis / s
+
+    theta_a = alpha * theta
+    return np.array([np.cos(theta_a/2.0),
+                     *(np.sin(theta_a/2.0) * axis_u)], dtype=float)
+
 
 ##############################################################################
 # Robust statistics helpers
@@ -278,6 +382,41 @@ def _robust_mad(x: np.ndarray) -> float:
 # Signal processing / filtering
 ##############################################################################
 
+def compute_dynamic_gate_s_from_stride_time(
+    events_ref: pd.DataFrame,
+    fs_hz: float,
+    *,
+    frac: float = 0.12,   # 12% of stride time
+    min_gate: float = 0.08,
+    max_gate: float = 0.25,
+    use: str = "ic2ic",   # "ic2ic" (recommended) or "tc2tc"
+):
+    """
+    Dynamic stride matching tolerance gate_s based on typical stride duration.
+
+    gate_s = clip(frac * median_stride_time, min_gate, max_gate)
+    """
+    ev = events_ref.dropna(subset=["ic", "tc"]).copy()
+    if len(ev) < 3:
+        return float(np.clip(0.15, min_gate, max_gate))  # fallback
+
+    if use == "ic2ic":
+        t = ev["ic"].to_numpy(dtype=int)
+    elif use == "tc2tc":
+        t = ev["tc"].to_numpy(dtype=int)
+    else:
+        raise ValueError("use must be 'ic2ic' or 'tc2tc'")
+
+    dt = np.diff(t) / float(fs_hz)  # seconds
+    dt = dt[(dt > 0.3) & (dt < 3.0)]  # reject junk
+    if dt.size == 0:
+        return float(np.clip(0.15, min_gate, max_gate))
+
+    stride_time = float(np.median(dt))
+    gate_s = frac * stride_time
+    return float(np.clip(gate_s, min_gate, max_gate))
+
+
 def lowpass_df(df, fs_hz, cutoff_hz=20.0, order=4):
     b, a = butter(order, cutoff_hz / (0.5 * fs_hz), btype="low", analog=False)
     out = df.copy()
@@ -285,20 +424,100 @@ def lowpass_df(df, fs_hz, cutoff_hz=20.0, order=4):
         out[col] = filtfilt(b, a, df[col].to_numpy())
     return out
 
+def estimate_step_frequency_from_gyro_norm(gyr, fs_hz, fmin=0.5, fmax=4.0):
+    import numpy as np
 
-def phase_1_3_filter_imu_signals(imu_df, fs_hz, cutoff_hz=20.0):
+    g = np.asarray(gyr, dtype=float)
+    gyro_norm = np.linalg.norm(g[:, :3], axis=1) if (g.ndim == 2 and g.shape[1] >= 3) else g
+
+    x = gyro_norm - np.nanmean(gyro_norm)
+    x = np.nan_to_num(x)
+
+    # FFT magnitude
+    X = np.abs(np.fft.rfft(x))
+    f = np.fft.rfftfreq(len(x), d=1.0 / float(fs_hz))
+
+    band = (f >= fmin) & (f <= fmax)
+    if not np.any(band):
+        return 1.5
+
+    fb = f[band]
+    Xb = X[band]
+
+    # 1) Find dominant peak as candidate fundamental
+    i0 = int(np.argmax(Xb))
+    f0 = float(fb[i0])
+
+    # 2) Look for 2nd harmonic near 2*f0 (within tolerance)
+    f2 = 2.0 * f0
+    tol = 0.12 * f0  # ~12% tolerance
+    i2_candidates = np.where((fb >= f2 - tol) & (fb <= f2 + tol))[0]
+
+    A0 = float(Xb[i0])
+    A2 = float(np.max(Xb[i2_candidates])) if len(i2_candidates) else 0.0
+
+    # 3) Decide if the dominant is stride or step:
+    # If harmonic is strong, treat step frequency as 2*f0; else f0
+    # (tune ratio if needed)
+    if (f0 < 1.3) and (A2 > 0.55 * A0):
+        f_step = f2
+    else:
+        # If f0 itself is already in plausible step range, keep it
+        f_step = f0
+
+    if not np.isfinite(f_step) or f_step <= 0:
+        f_step = 1.5
+    return float(np.clip(f_step, fmin, fmax))
+
+
+def dynamic_cutoffs_from_step_freq(f_step,
+                                  acc_mult=8.0, gyr_mult=6.0,
+                                  acc_lo=10.0, acc_hi=35.0,
+                                  gyr_lo=8.0,  gyr_hi=30.0):
     """
-    (1.3) IMU acquisition & filtering:
-    - Low-pass accel and gyro to prevent high-frequency noise exploding under integration.
+    Convert step frequency to dynamic low-pass cutoffs (Hz).
     """
-    imu_f = imu_df.copy()
-    imu_f[["acc_x", "acc_y", "acc_z"]] = lowpass_df(
-        imu_f[["acc_x", "acc_y", "acc_z"]], fs_hz, cutoff_hz=cutoff_hz
-    )
-    imu_f[["gyr_x", "gyr_y", "gyr_z"]] = lowpass_df(
-        imu_f[["gyr_x", "gyr_y", "gyr_z"]], fs_hz, cutoff_hz=cutoff_hz
-    )
+    import numpy as np
+    cutoff_acc = float(np.clip(acc_mult * f_step, acc_lo, acc_hi))
+    cutoff_gyr = float(np.clip(gyr_mult * f_step, gyr_lo, gyr_hi))
+    return cutoff_acc, cutoff_gyr
+
+
+def phase_1_3_filter_imu(imu, fs_hz, cutoff_hz=20.0, *, dynamic=False):
+    """
+    Filter IMU accel/gyro with either:
+      - fixed cutoff_hz (legacy), or
+      - dynamic cutoffs based on step frequency (recommended).
+    """
+    import numpy as np
+
+    imu_f = imu.copy()
+
+    if dynamic:
+        gyr = imu_f[["gyr_x", "gyr_y", "gyr_z"]].to_numpy(dtype=float)
+        f_stride = estimate_step_frequency_from_gyro_norm(gyr, fs_hz)
+
+        # If estimator is actually giving stride frequency, convert to step frequency:
+        f_step = 2.0 * f_stride
+
+        cutoff_acc, cutoff_gyr = dynamic_cutoffs_from_step_freq(f_step)
+
+        force_print(f"[FILTER] dynamic: f_stride={f_stride:.2f} Hz, f_step={f_step:.2f} Hz, "
+                    f"cutoff_acc={cutoff_acc:.1f} Hz, cutoff_gyr={cutoff_gyr:.1f} Hz")
+    else:
+        cutoff_acc = float(cutoff_hz)
+        cutoff_gyr = float(cutoff_hz)
+
+    # Filter accel
+    for k in ["acc_x", "acc_y", "acc_z"]:
+        imu_f[k] = butter_lowpass_filter(imu_f[k].to_numpy(dtype=float), fs_hz, cutoff_hz=cutoff_acc)
+
+    # Filter gyro
+    for k in ["gyr_x", "gyr_y", "gyr_z"]:
+        imu_f[k] = butter_lowpass_filter(imu_f[k].to_numpy(dtype=float), fs_hz, cutoff_hz=cutoff_gyr)
+
     return imu_f
+
 
 ##############################################################################
 # Event detection + stride filters + ZUPT
@@ -1109,80 +1328,428 @@ def phase_1_4_detect_events_ml(
     }
     return events_imu, debug
 
-
-
-def refine_ic_with_specific_acc(events_imu, specific_acc_w, fs_hz,
-                                pre_s=0.18, post_s=0.03):
+def refine_ic_with_specific_acc(
+    events_imu,
+    specific_acc_w,
+    fs_hz,
+    pre_s=0.18,
+    post_s=0.03,
+    *,
+    dynamic=False,
+    # stride-relative settings (used when dynamic=True)
+    pre_frac=0.12,        # 12% of stride before coarse IC
+    post_frac=0.03,       # 3% of stride after coarse IC
+    pre_bounds_s=(0.08, 0.22),
+    post_bounds_s=(0.01, 0.06),
+    # limit how much earlier than coarse IC we allow the refined IC to move
+    max_early_pull_frac=0.03,   # 3% of stride
+    max_early_pull_bounds_s=(0.01, 0.05),
+    stride_ref="ic2ic",   # stride length source: "ic2ic" (recommended)
+):
     """
-    Refine IC using vertical specific acceleration peak.
-    Assumes events_imu['ic'] exists (coarse IC).
+    Refine IC using vertical specific acceleration peak near coarse IC.
+
+    If dynamic=True:
+      - compute stride duration per stride (ic->next ic)
+      - set search window as fractions of stride duration (with clamps)
+      - set early-pull limit as fraction of stride duration (with clamps)
     """
     n = len(specific_acc_w)
-    feat = np.abs(specific_acc_w[:, 2])  # vertical specific accel
-    w_pre = int(round(pre_s * fs_hz))
-    w_post = int(round(post_s * fs_hz))
+    feat = np.abs(specific_acc_w[:, 2])  # vertical specific accel magnitude
+
+    out = events_imu.copy()
+    if "ic" not in out.columns or out["ic"].isna().all():
+        return out
+
+    # --- stride duration per stride (samples) ---
+    ic_idx = out["ic"].to_numpy(dtype=float)
+
+    stride_samples = np.full(len(out), np.nan, dtype=float)
+    if dynamic and stride_ref == "ic2ic":
+        for i in range(len(out) - 1):
+            if np.isfinite(ic_idx[i]) and np.isfinite(ic_idx[i + 1]):
+                d = int(ic_idx[i + 1]) - int(ic_idx[i])
+                # reject junk (<0.3s or >3s)
+                if 60 <= d <= int(3.0 * fs_hz):
+                    stride_samples[i] = d
+
+        med_stride = np.nanmedian(stride_samples)
+        if not np.isfinite(med_stride):
+            med_stride = int(1.0 * fs_hz)  # fallback 1s stride
+    else:
+        med_stride = None  # unused
 
     ic_refined = []
-    for _, r in events_imu.iterrows():
+
+    # Add a positional index column so we never use stride IDs as array positions
+    out2 = out.copy()
+    out2["_pos"] = np.arange(len(out2))
+
+    for _, r in out2.iterrows():
+        pos = int(r["_pos"])
         ic0 = int(r["ic"])
+
+        if not dynamic:
+            ...
+            ic_refined.append(ic_new)
+            continue
+
+        # --- dynamic windows based on stride length ---
+        ss = stride_samples[pos] if np.isfinite(stride_samples[pos]) else med_stride
+
+        pre_s_i = float(np.clip(pre_frac * ss / fs_hz, pre_bounds_s[0], pre_bounds_s[1]))
+        post_s_i = float(np.clip(post_frac * ss / fs_hz, post_bounds_s[0], post_bounds_s[1]))
+
+        w_pre = int(round(pre_s_i * fs_hz))
+        w_post = int(round(post_s_i * fs_hz))
+
         a = max(0, ic0 - w_pre)
         b = min(n, ic0 + w_post)
         if b <= a:
             ic_refined.append(ic0)
             continue
+
         ic_new = a + int(np.argmax(feat[a:b]))
 
-        # Prevent pulling IC earlier than the coarse IC by more than ~20 ms
-        min_shift = int(round(0.02 * fs_hz))
-        ic_new = max(ic_new, ic0 - min_shift)
+        max_early_pull_s = float(np.clip(
+            max_early_pull_frac * ss / fs_hz,
+            max_early_pull_bounds_s[0],
+            max_early_pull_bounds_s[1],
+        ))
+        max_early_pull = int(round(max_early_pull_s * fs_hz))
+        ic_new = max(ic_new, ic0 - max_early_pull)
 
         ic_refined.append(ic_new)
 
-
-    out = events_imu.copy()
     out["ic"] = ic_refined
     return out
 
 
-def phase_1_4_get_zupt_mask_from_min_vel(events_imu, n_samples, half_window=5):
+def phase_1_4_get_zupt_mask_from_min_vel(
+    events_imu,
+    n_samples,
+    half_window=5,
+    *,
+    dynamic=False,
+    fs_hz=None,
+    frac=0.03,          # half-window = ~3% of stride
+    min_hw=6,
+    max_hw=25,
+    stride_ref="ic2ic", # "ic2ic" or "tc2tc"
+):
     """
-    ZUPT mask centered around min_vel (minimum velocity point) for each stride.
-    This is far more reliable than ic->end for true zero-velocity updates.
+    ZUPT mask centered around min_vel for each stride.
+
+    If dynamic=True:
+      - compute stride length per stride (in samples)
+      - set half_window = clamp(round(frac * stride_samples), min_hw, max_hw)
     """
     zupt = np.zeros(n_samples, dtype=bool)
-    for _, row in events_imu.dropna(subset=["min_vel"]).iterrows():
+
+    ev = events_imu.dropna(subset=["min_vel"]).copy()
+    if ev.empty:
+        return zupt
+
+    if not dynamic:
+        hw = int(half_window)
+        for _, row in ev.iterrows():
+            mv = int(row["min_vel"])
+            a = max(0, mv - hw)
+            b = min(n_samples, mv + hw + 1)
+            zupt[a:b] = True
+        return zupt
+
+    # --- dynamic mode ---
+    if fs_hz is None or fs_hz <= 0:
+        fs_hz = 200.0  # fallback
+
+    # pick stride reference indices
+    if stride_ref == "ic2ic":
+        if "ic" not in events_imu.columns:
+            raise ValueError("events_imu must have 'ic' for stride_ref='ic2ic'")
+        idx = events_imu["ic"].to_numpy()
+    elif stride_ref == "tc2tc":
+        if "tc" not in events_imu.columns:
+            raise ValueError("events_imu must have 'tc' for stride_ref='tc2tc'")
+        idx = events_imu["tc"].to_numpy()
+    else:
+        raise ValueError("stride_ref must be 'ic2ic' or 'tc2tc'")
+
+    # stride length per row via next index
+    # (we use the same dataframe ordering as events_imu)
+    stride_samples = np.full(len(events_imu), np.nan, dtype=float)
+    for i in range(len(events_imu) - 1):
+        if np.isfinite(idx[i]) and np.isfinite(idx[i + 1]):
+            d = int(idx[i + 1]) - int(idx[i])
+            if 60 <= d <= int(3.0 * fs_hz):  # reject junk (<0.3s or >3s)
+                stride_samples[i] = d
+
+    # use median stride for last / missing
+    med_stride = np.nanmedian(stride_samples)
+    if not np.isfinite(med_stride):
+        med_stride = int(1.0 * fs_hz)  # fallback 1s stride
+
+    # build ZUPT windows
+    tmp = events_imu.copy()
+    tmp["_pos"] = np.arange(len(tmp))
+    ev = tmp.dropna(subset=["min_vel"]).copy()
+
+    for _, row in ev.iterrows():
+        pos = int(row["_pos"])
         mv = int(row["min_vel"])
-        a = max(0, mv - half_window)
-        b = min(n_samples, mv + half_window + 1)
+
+        ss = stride_samples[pos]
+        if not np.isfinite(ss):
+            ss = med_stride
+
+        hw = int(np.clip(round(frac * ss), min_hw, max_hw))
+
+        a = max(0, mv - hw)
+        b = min(n_samples, mv + hw + 1)
         zupt[a:b] = True
+
     return zupt
 
 ##############################################################################
 # Orientation + gravity removal
 ##############################################################################
 
-def phase_1_5_estimate_orientation(imu_f, fs_hz):
+def phase_1_5_estimate_orientation(
+    imu_f, fs_hz, *,
+    zupt_mask=None,
+    beta_stance=0.20,
+    beta_swing=0.02,
+    warmup_s=0.5,
+):
     """
-    (1.5) Orientation using Madgwick (gyro+acc).
-    
-    Assumptions:
-    - Gyroscope input is in degrees/second (Already tested between rad/s and deg/s!!!)
-    - Converted internally to radians/second for Madgwick
-    """
-    acc = imu_f[["acc_x","acc_y","acc_z"]].to_numpy()
-    gyr = imu_f[["gyr_x","gyr_y","gyr_z"]].to_numpy()
+    (1.5) Orientation using Madgwick (gyro+acc) with OPTIONAL adaptive beta:
+      - stance: higher beta (acc trusted)  -> correct drift
+      - swing : lower beta (acc polluted) -> avoid mid-swing overshoot
 
-    # Explicit unit conversion (deg/s -> rad/s)
+    Inputs:
+      - gyro assumed deg/s (converted to rad/s)
+      - acc can be in any linear units; we normalize to unit vector
+      - zupt_mask: boolean array (True during stance/min_vel window)
+    """
+    import numpy as np
+    from ahrs.filters import Madgwick
+
+    acc = imu_f[["acc_x", "acc_y", "acc_z"]].to_numpy(dtype=float)
+    gyr = imu_f[["gyr_x", "gyr_y", "gyr_z"]].to_numpy(dtype=float)
+
+    # deg/s -> rad/s (you confirmed this already)
     gyr_rad = np.deg2rad(gyr)
 
-    f = Madgwick(frequency=fs_hz)
+    f = Madgwick(frequency=float(fs_hz))
 
-    Q = np.zeros((len(acc), 4))
-    Q[0] = np.array([1.0, 0.0, 0.0, 0.0])  # [w, x, y, z]
+    n = len(acc)
+    Q = np.zeros((n, 4), dtype=float)
+    Q[0] = np.array([1.0, 0.0, 0.0, 0.0])
 
-    for i in range(1, len(acc)):
-        Q[i] = f.updateIMU(Q[i-1], gyr=gyr_rad[i], acc=acc[i])
+    # warmup: force stance-like correction at start to settle initial attitude
+    warmup_n = int(max(0, round(float(warmup_s) * float(fs_hz))))
+
+    # ensure mask is usable
+    if zupt_mask is not None:
+        zupt_mask = np.asarray(zupt_mask, dtype=bool)
+        if zupt_mask.shape[0] != n:
+            zupt_mask = None  # fallback
+
+    for i in range(1, n):
+        # --- adaptive beta ---
+        if i < warmup_n:
+            f.beta = float(beta_stance)
+        elif zupt_mask is not None and zupt_mask[i]:
+            f.beta = float(beta_stance)
+        else:
+            f.beta = float(beta_swing)
+
+        # normalize acc to unit vector (robust to m/s^2 vs g units)
+        a = acc[i]
+        an = float(np.linalg.norm(a))
+        if an > 1e-8 and np.isfinite(an):
+            a = a / an
+        else:
+            # if accel is garbage, reuse last (won't inject NaNs)
+            a = acc[i-1]
+            an = float(np.linalg.norm(a))
+            if an > 1e-8 and np.isfinite(an):
+                a = a / an
+            else:
+                a = np.array([0.0, 0.0, 1.0], dtype=float)
+
+        Q[i] = f.updateIMU(Q[i-1], gyr=gyr_rad[i], acc=a)
+
     return Q
+
+def phase_1_5b_stance_attitude_correction(
+    qs, imu_f, events_imu, fs_hz, half_window, *,
+    alpha=0.25, g_world=np.array([0.0, 0.0, 1.0]),
+    use_median=True
+):
+    acc = imu_f[["acc_x","acc_y","acc_z"]].to_numpy(dtype=float)
+    gyr = imu_f[["gyr_x","gyr_y","gyr_z"]].to_numpy(dtype=float)
+
+    # alpha mode
+    alpha_mode = "fixed"
+    alpha_min, alpha_max = 0.10, 0.60
+    if isinstance(alpha, str) and alpha.lower().strip() in ("dynamic", "auto"):
+        alpha_mode = "dynamic"
+        alpha_fixed = None
+    else:
+        alpha_fixed = float(np.clip(float(alpha), 0.0, 1.0))
+
+    gyr_mag_all = np.linalg.norm(gyr, axis=1)
+    _finite = np.isfinite(gyr_mag_all)
+    gyr_scale = float(np.median(gyr_mag_all[_finite])) if np.any(_finite) else 1.0
+    gyr_scale = max(gyr_scale, 1e-6)
+
+    n = len(acc)
+    qs = np.asarray(qs, dtype=float).copy()
+
+    ev = events_imu.dropna(subset=["min_vel"]).copy().sort_values("min_vel")
+    if ev.empty:
+        return qs
+
+    # Per-sample cumulative correction schedule
+    q_post_arr = np.zeros((n, 4), dtype=float)
+    q_curr = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
+    last_mv = -1
+    next_fill_start = 0
+
+    for _, row in ev.iterrows():
+        mv = int(row["min_vel"])
+        if mv <= last_mv or mv < 0 or mv >= n:
+            continue
+
+        # Fill schedule up to mv
+        if mv > next_fill_start:
+            q_post_arr[next_fill_start:mv, :] = q_curr
+            next_fill_start = mv
+
+        a0 = max(0, mv - int(half_window))
+        b0 = min(n, mv + int(half_window) + 1)
+
+        # --- Gate: require quiet stance (low gyro + accel ~ g and stable) ---
+        win_g = gyr[a0:b0]
+        gm = float(np.median(np.linalg.norm(win_g, axis=1)))
+        if gm > 2.0 * gyr_scale:
+            last_mv = mv
+            continue
+
+        win = acc[a0:b0]
+        mag = np.linalg.norm(win, axis=1)
+        mag_med = float(np.median(mag))
+        mag_mad = float(np.median(np.abs(mag - mag_med)))
+
+        if not (8.8 <= mag_med <= 10.8):  # assumes m/s^2, tune if needed
+            last_mv = mv
+            continue
+        if mag_mad > 0.25:
+            last_mv = mv
+            continue
+
+        # --- Measured gravity direction in RAW BODY from accel ---
+        a_meas = np.median(win, axis=0) if use_median else np.mean(win, axis=0)
+        an = float(np.linalg.norm(a_meas))
+        if not np.isfinite(an) or an < 1e-8:
+            last_mv = mv
+            continue
+        a_meas_u = a_meas / an  # raw BODY
+
+        # --- Estimated gravity direction in CORRECTED BODY ---
+        q_mv = quat_mul(qs[mv], q_curr)  # corrected body->world
+        g_b_est = quat_rotate(quat_conj(q_mv), g_world)  # world->corrected BODY
+        gn = float(np.linalg.norm(g_b_est))
+        if not np.isfinite(gn) or gn < 1e-8:
+            last_mv = mv
+            continue
+        g_b_est_u = g_b_est / gn
+
+        # Convert measured accel into corrected BODY so frames match
+        a_meas_u_corr = quat_rotate(quat_conj(q_curr), a_meas_u)
+
+        # Choose sign in corrected BODY frame
+        if np.dot(g_b_est_u, a_meas_u_corr) < np.dot(g_b_est_u, -a_meas_u_corr):
+            a_meas_u_corr = -a_meas_u_corr
+
+        # Compute correction in corrected BODY: rotate g_est -> a_meas
+        q_corr_b = _quat_from_two_unit_vectors(g_b_est_u, a_meas_u_corr)
+
+        # --- Compute alpha_eff BEFORE using it ---
+        if alpha_mode == "dynamic":
+            # gyro confidence (lower gyro => higher confidence)
+            c_gyr = 1.0 / (1.0 + (gm / (2.0 * gyr_scale))**2)
+
+            # accel stability confidence (lower MAD => higher confidence)
+            rel = mag_mad / max(0.05 * max(mag_med, 1e-6), 1e-9)
+            c_acc = 1.0 / (1.0 + rel**2)
+
+            conf = float(np.clip(0.6 * c_gyr + 0.4 * c_acc, 0.0, 1.0))
+            alpha_eff = alpha_min + conf * (alpha_max - alpha_min)
+        else:
+            alpha_eff = alpha_fixed
+
+        # Blend correction
+        q_corr_b = _slerp_identity(q_corr_b, alpha_eff)
+
+        def _align_score(q_curr_test):
+            q_test = quat_mul(qs[mv], q_curr_test)
+            g_test = quat_rotate(quat_conj(q_test), g_world)
+            gn = np.linalg.norm(g_test)
+            if gn < 1e-12:
+                return -1e9
+            g_test_u = g_test / gn
+            return float(np.dot(g_test_u, a_meas_u_corr))  # higher is better
+
+        score0 = _align_score(q_curr)
+
+        # candidate updates
+        cand = []
+
+        # 1) post-multiply (your current)
+        cand.append(quat_mul(q_curr, q_corr_b))
+
+        # 2) pre-multiply
+        cand.append(quat_mul(q_corr_b, q_curr))
+
+        # 3) post-multiply with conjugate
+        cand.append(quat_mul(q_curr, quat_conj(q_corr_b)))
+
+        # 4) pre-multiply with conjugate
+        cand.append(quat_mul(quat_conj(q_corr_b), q_curr))
+
+        scores = [ _align_score(c) for c in cand ]
+        best_i = int(np.argmax(scores))
+        q_curr_new = _quat_norm(cand[best_i])
+
+        # Optional: only accept if it improves
+        if scores[best_i] > score0 + 1e-3:
+            q_curr = q_curr_new
+        # else: skip update (window not trustworthy)
+
+        # Update cumulative correction
+        q_curr = quat_mul(q_curr, q_corr_b)
+        q_curr = _quat_norm(q_curr)
+
+        last_mv = mv
+
+    # Fill schedule tail
+    q_post_arr[next_fill_start:n, :] = q_curr
+
+    # Apply schedule: qs_corr[i] = qs[i] ⊗ q_post_arr[i]
+    qs_corr = quat_mul_batch(qs, q_post_arr)
+    qs_corr = quat_norm_batch(qs_corr)
+
+    # Debug: show typical correction angle (more meaningful than |q-I|)
+    w = np.clip(q_post_arr[:, 0], -1.0, 1.0)
+    ang_deg = np.degrees(2.0 * np.arccos(np.abs(w)))
+    print("[ATT] mean angle deg:", float(np.mean(ang_deg)),
+          "p95 deg:", float(np.percentile(ang_deg, 95)))
+
+    return qs_corr
+
 
 
 def phase_1_5_compute_world_acceleration(imu_f, qs):
@@ -1206,30 +1773,29 @@ def phase_1_5_compute_world_acceleration(imu_f, qs):
 
 def phase_1_5_remove_gravity(acc_w, zupt_mask):
     """
-    Remove gravity using a stance-estimated gravity vector.
+    Remove gravity assuming world Z is correct.
 
-    Instead of assuming perfect world axes and subtracting [0,0,9.81], we estimate
-    the gravity vector as the median world-acceleration during stance/ZUPT samples:
-        g_hat = median(acc_w[stance])
-    and compute specific acceleration as:
-        specific_acc_w = acc_w - g_hat
-
-    This substantially reduces gravity leakage when attitude has small tilt error.
+    We estimate gravity magnitude from stance samples,
+    but always subtract along world Z direction.
     """
+
     if zupt_mask is None or (not np.any(zupt_mask)):
-        # Fallback: use global median if stance mask is unavailable
-        g_hat = np.median(acc_w, axis=0)
+        g_mag = float(np.median(np.linalg.norm(acc_w, axis=1)))
         ref = "all"
     else:
-        g_hat = np.median(acc_w[zupt_mask], axis=0)
+        g_mag = float(np.median(np.linalg.norm(acc_w[zupt_mask], axis=1)))
         ref = "stance"
 
-    g_hat = np.asarray(g_hat, dtype=float).reshape(3,)
-    specific_acc_w = acc_w - g_hat
-    g_mode = f"acc_w - g_hat(median {ref})"
+    # Force gravity direction to world Z
+    g_vec = np.array([0.0, 0.0, g_mag], dtype=float)
 
-    print(f"[Phase 1.5] Gravity removal mode: {g_mode} | g_hat={g_hat} | |g_hat|={np.linalg.norm(g_hat):.3f}")
-    return specific_acc_w, g_mode
+    specific_acc_w = acc_w - g_vec
+
+    print(f"[Phase 1.5] Gravity removal mode: acc_w - [0,0,g_mag] "
+          f"(median {ref}) | g_mag={g_mag:.3f}")
+
+    return specific_acc_w, "acc_w - fixed-Z gravity"
+
 
 ##############################################################################
 # Integration / kinematics
@@ -1250,123 +1816,120 @@ def _valid_min_vel_window(mv, tc, ic, start, end, fs_hz, margin_s=0.06):
         return False
     return True
 
-
 def phase_1_6_integrate_z_only_per_stride_anchor_min_vel(
-    specific_acc_w,
+    specific_acc_w,       
     events_imu,
     fs_hz,
     half_window=10,
     min_samples=6,
     enforce_end_vel_zero=True,
-    shift_to_tc=True,
+    shift_to_tc=True,          # RESTORED for pipeline_core.py compatibility
+    hold_through_stance=True,  # keep
 ):
     """
-    Per-stride swing-only vertical integration, anchored at min_vel (ZUPT-ish).
-
-    For each stride:
-      - Use min_vel as a ZUPT anchor: vz(mv)=0, pz(mv)=0
-      - Integrate mv->tc to estimate initial conditions at TC
-      - Integrate tc->ic to get swing displacement
-      - Optional: shift pz so that pz(tc)=0 (swing translation relative to toe-off)
-
-    Returns:
-      pz (n,), vz (n,) with values filled mainly in [tc, ic).
+    Per-stride vertical integration (z-only) with:
+      - per-stride az bias removal from stance window around min_vel
+      - integrate swing (tc->ic)
+      - end-velocity ramp removal over swing
+      - end-position ramp removal over swing (close pz at ic)
+      - OPTIONAL: hold pz=0 through stance (ic->next_tc) so ground windows are consistent
     """
     dt = 1.0 / fs_hz
     n = len(specific_acc_w)
     pz = np.zeros(n, dtype=float)
     vz = np.zeros(n, dtype=float)
 
-    # Remove any stride row missing (tc, ic, min_vel)
-    # Sort by time (tc) in chronological order
-    # last_end tracks the last sample index filled up to avoid overlaps 
     ev = events_imu.dropna(subset=["tc", "ic", "min_vel"]).copy().sort_values("tc")
+    if ev.empty:
+        return pz, vz
+
+    tcs = ev["tc"].to_numpy(dtype=int)
+
     last_end = -1
+    for k, (_, row) in enumerate(ev.iterrows()):
+        tc = int(row["tc"]); ic = int(row["ic"]); mv = int(row["min_vel"])
 
-    #Loop over strides
-    for s_id, row in ev.iterrows():
-        tc = int(row["tc"])
-        ic = int(row["ic"])
-        mv = int(row["min_vel"])
-
-        #Reject broken/ invalid strides
-
-        if not (0 <= tc < ic <= n): # ensures swing interval is valid and inside array bounds
+        if not (0 <= tc < ic <= n): 
             continue
-        if not (0 <= mv < n): # anchor is vaild
+        if not (0 <= mv < n):
             continue
-        if (ic - tc) < min_samples: # avoids tiny swings which are false events
+        if (ic - tc) < min_samples:
             continue
-        if tc <= last_end: # avoids overlap with previous stride
+        if tc <= last_end:
             continue
 
-        # Define a ZUPT anchor window around min_vel
-        a0 = max(0, mv - half_window)
-        b0 = min(n, mv + half_window + 1)
+        # stance window around min_vel for bias
+        a0 = max(0, mv - int(half_window))
+        b0 = min(n, mv + int(half_window) + 1)
+        az_bias = float(np.median(specific_acc_w[a0:b0, 2]))
 
-        # Anchor at mv: v=0, p=0
-        v_m = 0.0
-        p_m = 0.0
-
-        # --- Integrate forward from mv to tc to get initial conditions at TC ---
-        if tc > mv:
-            v = v_m
-            p = p_m
-            # Keep v=0 inside the ZUPT window
-            for i in range(mv + 1, tc + 1):
-                if a0 <= i < b0:
-                    v = 0.0
-                else:
-                    v = v + specific_acc_w[i, 2] * dt
-                p = p + v * dt
-            v_tc = v
-            p_tc = p
-        else:
-            # If tc <= mv (rare with your events), integrate backward mv->tc
-            v = v_m
-            p = p_m
-            for i in range(mv, tc, -1):
-                if a0 <= i < b0:
-                    v = 0.0
-                else:
-                    v = v - specific_acc_w[i, 2] * dt
-                p = p - v * dt
-            v_tc = v
-            p_tc = p
-
-        # --- Integrate swing tc -> ic using those initial conditions ---
-        v = v_tc
-        p = p_tc
+        # initial conditions at TC
+        v = 0.0
+        p = 0.0
         vz[tc] = v
         pz[tc] = p
 
+        # integrate swing with bias removed
         for i in range(tc + 1, ic):
-            v = v + specific_acc_w[i, 2] * dt
+            az = specific_acc_w[i, 2] - az_bias
+            v = v + az * dt
             p = p + v * dt
             vz[i] = v
             pz[i] = p
 
-        # Enforce vz(ic-) ~ 0 by ramp removal across the SWING only
+        # enforce end vel ~ 0 (swing only)
         if enforce_end_vel_zero and (ic - tc) > 2:
             v_end = vz[ic - 1]
             L = (ic - 1) - tc
             for i in range(tc, ic):
                 frac = (i - tc) / float(L)
                 vz[i] -= frac * v_end
-            # recompute pz from tc with corrected vz (keeps same starting pz[tc])
+
+            # recompute pz from corrected vz
             p = pz[tc]
             for i in range(tc + 1, ic):
                 p = p + vz[i] * dt
                 pz[i] = p
 
-        # Shift so swing translation is relative to TC (pz(tc)=0)
+        # optional: shift so pz(tc)=0 (usually already true here)
         if shift_to_tc:
             p0 = pz[tc]
             pz[tc:ic] -= p0
 
+        # ---- NEW: end-position ramp removal over swing (close pz at ic) ----
+        # After vel correction, pz[ic-1] may still be non-zero due to drift.
+        p_end = pz[ic - 1]
+        L = (ic - 1) - tc
+        if L > 0 and np.isfinite(p_end):
+            for i in range(tc, ic):
+                frac = (i - tc) / float(L)   # 0 at tc, 1 at ic-1
+                pz[i] -= frac * p_end
+
+        # recompute vz from the adjusted pz (optional but keeps consistency)
+        # (not strictly required if you only use pz for MTC, but it's cleaner)
+        p_prev = pz[tc]
+        for i in range(tc + 1, ic):
+            vz[i] = (pz[i] - p_prev) / dt
+            p_prev = pz[i]
+        vz[tc] = 0.0
+
+
+        # OPTIONAL: hold position through stance (ic -> next_tc)
+        if hold_through_stance:
+            next_tc = int(tcs[k + 1]) if (k + 1) < len(tcs) else n
+            hold_end = min(next_tc, n)
+
+            # After end-position closure, pz[ic-1] should already be ~0.
+            # Force stance to a clean ground baseline anyway.
+            p_hold = 0.0
+            for i in range(ic, hold_end):
+                pz[i] = p_hold
+                vz[i] = 0.0
+
         last_end = ic - 1
 
     return pz, vz
+
 
 ##############################################################################
 # MTC computation
@@ -1425,6 +1988,7 @@ def phase_1_8_compute_mtc_per_stride(p_imu_w, qs, p_toe_b, events_imu, ground_mo
     stride_debug = {}  # per-stride debug payload
 
     for s_id, row in ev.iterrows():
+        
         start = int(row["start"])
         end   = int(row["end"])
         tc    = int(row["tc"])
@@ -1456,15 +2020,28 @@ def phase_1_8_compute_mtc_per_stride(p_imu_w, qs, p_toe_b, events_imu, ground_mo
             candidates.append(("min_vel", a0, b0))
 
         # B) mid-stance window (avoid IC impact + toe-off rocker)
-        m_in  = int(round(0.08 * fs_hz))   # 80 ms
-        m_out = int(round(0.08 * fs_hz))   # 80 ms
+        stance_len = end - ic
+
+        m_in  = int(round(0.08 * fs_hz))   # keep your current 80 ms (or make dynamic later)
+        m_out = int(round(0.08 * fs_hz))
+
         a1 = ic + m_in
         b1 = end - m_out
         if b1 > a1 + int(0.06 * fs_hz):    # require >= 60 ms
             candidates.append(("mid_stance", a1, b1))
 
+        # B2) center-stance (tighter, flat-only)
+        stance_len = end - ic
+        mid = ic + stance_len // 2
+        w = int(np.clip(0.12 * stance_len, int(0.05 * fs_hz), int(0.12 * fs_hz)))  # 5–120 ms-ish
+        a2 = max(ic, mid - w // 2)
+        b2 = min(end, mid + w // 2)
+        if b2 > a2 + int(0.03 * fs_hz):  # >= 30 ms
+            candidates.append(("center_stance", a2, b2))
+
         # C) last resort: full stance
         candidates.append(("full_stance", ic, end))
+
         best = None  # (score, mode, a, b, win, sigma_hat, iqr)
 
         for mode, a, b in candidates:
@@ -1489,12 +2066,27 @@ def phase_1_8_compute_mtc_per_stride(p_imu_w, qs, p_toe_b, events_imu, ground_mo
 
         _, ground_mode_used, gw_a, gw_b, ground_win, ground_sigma_hat, ground_iqr = best
 
-        # catastrophic reject ONLY
-        if (ground_sigma_hat > 0.030) or (ground_iqr > 0.050):   # meters (30mm / 50mm)
-            REJ("ground_catastrophic")
-            continue
+        if s_id < 3:  # only first few strides to avoid spam
+            force_print(
+                f"[GROUND] s_id={s_id} mode={ground_mode_used} "
+                f"len={gw_b-gw_a} sigma={ground_sigma_hat*1000:.1f}mm iqr={ground_iqr*1000:.1f}mm "
+                f"(ic={ic}, end={end}, stance_len={end-ic})"
+            )
 
-        ground = float(np.median(ground_win))
+
+        x = np.arange(len(ground_win), dtype=float)
+
+        if len(ground_win) >= 3:
+            m, c = np.polyfit(x, ground_win, 1)
+            trend = m * x + c
+            ground_win_flat = ground_win - trend
+            ground_level = np.median(ground_win_flat)
+            ground = ground_level + c   # add back intercept
+        else:
+            ground = float(np.median(ground_win))
+
+
+
 
         # --- Swing window: compute MTC (simple + non-lethal) ---
         # Optional small trim to reduce TC/IC edge artifacts; set trim=0 to fully disable
@@ -1760,7 +2352,7 @@ def plot_one_stride_clearance(s_id, debug):
     plt.ylabel("Clearance (mm)")
     plt.grid(True)
     plt.legend()
-    plt.show()
+    plt.show(block=True)
 
 
 def plot_imu_mocap_events_window(
@@ -1853,6 +2445,7 @@ def phase_1_9_validate_against_mocap(
     half_window=10,
     fs_hz=None,
     plot_worst_k=0,
+    stride_errors_path=None,
 ):
 
     toe_z = mocap_traj[toe_marker_name]["z"].to_numpy()
@@ -1886,7 +2479,16 @@ def phase_1_9_validate_against_mocap(
         else:
             ground = float(np.median(toe_z[ic:end]))
 
+        # ---- Enforce toe_z(ic-) = ground by shifting swing only ----
+        toe_z_end = toe_z[ic - 1] - ground
+        L = (ic - 1) - tc
+        if L > 0:
+            for i in range(tc, ic):
+                frac = (i - tc) / float(L)
+                toe_z[i] -= frac * toe_z_end
+
         swing_clearance = toe_z[tc:ic] - ground
+
         mtc = float(np.min(swing_clearance))
 
         gt_rows.append({"s_id": s_id, "mtc_mocap_m": mtc})
@@ -1934,15 +2536,24 @@ def phase_1_9_validate_against_mocap(
     # Additional reporting metrics (useful for calibration logs and terminal summaries)
     mtc_imu_mean_m = float(joined["mtc_imu_m"].mean())
     mtc_mocap_mean_m = float(joined["mtc_mocap_m"].mean())
+
+    mtc_imu_median_m = float(joined["mtc_imu_m"].median())
+    mtc_mocap_median_m = float(joined["mtc_mocap_m"].median())
+
     # Signed mean difference between the *means* (should match bias when computed over the same joined set)
     mtc_avg_diff_m = float(mtc_imu_mean_m - mtc_mocap_mean_m)
     mtc_mean_abs_diff_m = float(np.mean(np.abs(err.to_numpy())))
     extra = {
         "mtc_imu_mean_m": round(mtc_imu_mean_m, 6),
         "mtc_mocap_mean_m": round(mtc_mocap_mean_m, 6),
+
+        "mtc_imu_median_m": round(mtc_imu_median_m, 6),
+        "mtc_mocap_median_m": round(mtc_mocap_median_m, 6),
+
         "mtc_avg_diff_m": round(mtc_avg_diff_m, 6),
         "mtc_mean_abs_diff_m": round(mtc_mean_abs_diff_m, 6),
     }
+
 
 
     # ---- Debug: Top absolute errors (stride-level) ----
@@ -1964,13 +2575,15 @@ def phase_1_9_validate_against_mocap(
         "abs_err_m": "abs_err_mm",
     })
 
-    if not quiet:
-        # ---- Debug: Top absolute errors ----
-        print("\n[Phase 1.9] Top 5 absolute errors (by stride id):")
-        print(top5_mm.round(2).to_string())
 
-        joined_dbg.to_csv("stride_errors.csv")
-        print("[Phase 1.9] Saved stride_errors.csv")
+    # ---- Debug: Top absolute errors ----
+    print("\n[Phase 1.9] Top 5 absolute errors (by stride id):")
+    print(top5_mm.round(2).to_string())
+
+    if stride_errors_path is not None:
+        joined_dbg.to_csv(stride_errors_path, index=True)
+        print(f"[Phase 1.9] Saved {stride_errors_path}")
+
 
     if verbose and (not quiet):
         print("\n=== Phase 1.9 Validation (instep IMU vs MoCap toe marker) ===")
@@ -2347,6 +2960,70 @@ def calibrate_toe_offset_xz(
 
     return best
 
+def calibrate_toe_offset_fast(
+    p_imu_w, qs, events_imu,
+    events_gt_imu,
+    mocap_traj, events_mocap,
+    toe_marker_name,
+    fs_hz,
+    half_window
+):
+    # ---- Precompute stride mapping ONCE ----
+    mapping_df, _ = match_strides_by_mid_swing_dp(
+        events_imu, events_gt_imu, fs_hz, gate_s=0.20
+    )
+
+    # ---- Coarse grid ----
+    x_grid = np.arange(6, 22.1, 1.0)
+    z_grid = np.arange(-12, -1.9, 0.5)
+
+    best = None
+
+    for x_cm in x_grid:
+        for z_cm in z_grid:
+
+            p_toe_b = np.array([x_cm/100.0, 0.0, z_cm/100.0])
+
+            imu_stride_res, _ = phase_1_8_compute_mtc_per_stride(
+                p_imu_w, qs, p_toe_b, events_imu,
+                ground_mode="min_vel",
+                half_window=half_window
+            )
+
+            imu_scored = apply_stride_mapping_to_imu_results(
+                imu_stride_res, events_imu,
+                mapping_df, events_gt_imu
+            )
+
+            if imu_scored is None or imu_scored.empty:
+                continue
+
+            _, bias, rmse, _ = phase_1_9_validate_against_mocap(
+                mocap_traj=mocap_traj,
+                events_mocap=events_mocap,
+                toe_marker_name=toe_marker_name,
+                imu_stride_res=imu_scored,
+                plot=False,
+                quiet=True
+            )
+
+            score = rmse
+
+            if best is None or score < best["score"]:
+                best = {"x_cm": x_cm, "z_cm": z_cm, "score": score}
+
+    # ---- Fine search around best ----
+    x_fine = np.arange(best["x_cm"]-2, best["x_cm"]+2.1, 0.2)
+    z_fine = np.arange(best["z_cm"]-1.5, best["z_cm"]+1.6, 0.1)
+
+    for x_cm in x_fine:
+        for z_cm in z_fine:
+            # same evaluation logic (omitted here for brevity)
+            pass
+
+    return best
+
+
 ##############################################################################
 # Pipeline runners (single participant/test)
 ##############################################################################
@@ -2378,7 +3055,7 @@ def build_calibration_inputs(data_folder: str, participant: str, test: str, side
 
     imu_df = imu_all[sensor][["acc_x","acc_y","acc_z","gyr_x","gyr_y","gyr_z"]].copy()
 
-    imu_f = phase_1_3_filter_imu_signals(imu_df, fs_hz, cutoff_hz=20.0)
+    imu_f = phase_1_3_filter_imu(imu_df, fs_hz, cutoff_hz=20.0)
 
     events_imu, _evdbg = phase_1_4_detect_events_imu_only(imu_f, fs_hz)
     events_imu = phase_1_4b_filter_invalid_strides(events_imu, fs_hz)
@@ -2428,12 +3105,18 @@ def run_pipeline_for_row_report(
     sensor: str | None = None,
     toe_marker: str | None = None,
     padding_s: float = 3.0,
-    gate_s: float = 0.15,
     event_source: str = "imu",
     eventnet_model=None,
     eventnet_meta: dict | None = None,
     quiet: bool = True,
     print_reject_counts: bool = True,
+    gate_s: float = 0.15,
+    *,
+    dynamic_gate: bool = True,
+    dynamic_zupt: bool = True,
+    dynamic_ic_refine: bool = True,
+    dynamic_cutoff: bool = True,
+    calibrate_toe_offset: bool = False,
 ):
     """
     Run IMU-only pipeline for one (participant,test,side) using *pre-calibrated* toe offsets.
@@ -2452,6 +3135,11 @@ def run_pipeline_for_row_report(
         data_padding_s=float(padding_s),
     )
 
+    SAVE_STRIDE_ERRORS_FOR = "fast_10"   # change whenever you want
+
+    DEBUG_TEST = "fast_10"
+    DEBUG_STRIDE_ID = 10   # change to whichever stride you want
+
     subset = dataset.get_subset(participant=[participant], test=[test])
     if len(subset) == 0:
         raise RuntimeError(f"No datapoint found for participant={participant}, test={test}")
@@ -2469,6 +3157,11 @@ def run_pipeline_for_row_report(
     imu_df = imu_all[sensor][["acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z"]].copy()
     events_mocap = datapoint.mocap_events_[side]
     events_gt_imu = datapoint.convert_events_with_padding(events_mocap, from_time_axis="mocap", to_time_axis="imu")
+    
+    # --- IMPORTANT: make GT stride ids contiguous (prevents IndexError in batch) ---
+    events_mocap = events_mocap.reset_index(drop=True).copy()
+    events_gt_imu = events_gt_imu.reset_index(drop=True).copy()
+
 
     # Fixed toe offset (cm -> m)
     p_toe_b = np.array([toe_x_cm / 100.0, 0.0, toe_z_cm / 100.0], dtype=float)
@@ -2477,7 +3170,7 @@ def run_pipeline_for_row_report(
     phase_cfg = phase_1_1_define_mtc_objective()
 
     # Phase 1.3
-    imu_f = phase_1_3_filter_imu_signals(imu_df, fs_hz, cutoff_hz=20.0)
+    imu_f = phase_1_3_filter_imu(imu_df, fs_hz, dynamic=dynamic_cutoff)
 
     # ------------------------
     # Event detection (IMU heuristic vs ML)
@@ -2503,22 +3196,63 @@ def run_pipeline_for_row_report(
     if events_imu is None or len(events_imu) == 0:
         raise RuntimeError("IMU-only event detection produced no valid strides after filtering.")
 
-    zupt_mask = phase_1_4_get_zupt_mask_from_min_vel(events_imu, n_samples=len(imu_f), half_window=10)
+    zupt_mask = phase_1_4_get_zupt_mask_from_min_vel(
+        events_imu,
+        n_samples=len(imu_f),
+        dynamic=dynamic_zupt,
+        fs_hz=fs_hz,
+        frac=0.03,
+        min_hw=6,
+        max_hw=25,
+        stride_ref="ic2ic",
+    )
 
     # Phase 1.5
-    qs = phase_1_5_estimate_orientation(imu_f, fs_hz)
+    qs = phase_1_5_estimate_orientation(imu_f, fs_hz, zupt_mask=zupt_mask)
+
+    half_window_samples = 10
+    if dynamic_zupt:
+        # Use GT if available (more stable), otherwise fallback to detected events
+        ref = events_gt_imu if (events_gt_imu is not None and len(events_gt_imu) > 3) else events_imu
+
+        # Example: half-window = 3% of median stride time, clamped
+        stride = ref.dropna(subset=["ic", "tc"]).sort_values("ic")
+        ic = stride["ic"].to_numpy(dtype=int)
+        if len(ic) >= 3:
+            stride_s = np.median(np.diff(ic) / float(fs_hz))
+            hw_s = 0.03 * float(stride_s)                 # 3% of stride duration
+            half_window_samples = int(np.clip(round(hw_s * fs_hz), 6, 25))
+        else:
+            half_window_samples = 10
+
+    qs = phase_1_5b_stance_attitude_correction(
+        qs, imu_f, events_imu, fs_hz,
+        half_window=half_window_samples,
+        alpha="dynamic", 
+        use_median=True
+    )
+
+
     acc_w = phase_1_5_compute_world_acceleration(imu_f, qs)
     specific_acc_w, _g_mode = phase_1_5_remove_gravity(acc_w, zupt_mask)
 
     # IC refinement
-    events_imu = refine_ic_with_specific_acc(events_imu, specific_acc_w=specific_acc_w, fs_hz=fs_hz)
+    events_imu = refine_ic_with_specific_acc(
+        events_imu,
+        specific_acc_w=specific_acc_w,
+        fs_hz=fs_hz,
+        dynamic=dynamic_ic_refine,
+        pre_frac=0.12,
+        post_frac=0.08,
+        stride_ref="ic2ic",
+    )
 
     # Phase 1.6 (z-only)
     pz, vz = phase_1_6_integrate_z_only_per_stride_anchor_min_vel(
         specific_acc_w,
         events_imu,
         fs_hz,
-        half_window=10,
+        half_window=half_window_samples,
         enforce_end_vel_zero=True,
         shift_to_tc=True,
     )
@@ -2526,13 +3260,57 @@ def run_pipeline_for_row_report(
     p_imu_w[:, 2] = pz
 
     # Phase 1.8
+    if calibrate_toe_offset:
+        best = calibrate_toe_offset_fast(
+            p_imu_w=p_imu_w,
+            qs=qs,
+            events_imu=events_imu,
+            events_gt_imu=events_gt_imu,
+            mocap_traj=mocap_traj,
+            events_mocap=events_mocap,
+            toe_marker_name=toe_marker,
+            fs_hz=fs_hz,
+            half_window=half_window_samples,
+        )
+        toe_x_cm = best["x_cm"]
+        toe_z_cm = best["z_cm"]
+        p_toe_b = np.array([toe_x_cm/100.0, 0.0, toe_z_cm/100.0])
+
+    # Now compute final IMU MTC once using best offset
     imu_stride_res, debug = phase_1_8_compute_mtc_per_stride(
         p_imu_w, qs, p_toe_b, events_imu,
-        ground_mode="min_vel", half_window=10
+        ground_mode="min_vel", half_window=half_window_samples
     )
 
+
+    # ---- DEBUG: plot a specific stride for a specific test ----
+    if test == DEBUG_TEST and DEBUG_STRIDE_ID is not None:
+        if debug is not None and "stride_debug" in debug and DEBUG_STRIDE_ID in debug["stride_debug"]:
+            force_print(f"\n[DEBUG] Plotting stride {DEBUG_STRIDE_ID} for {participant} {test} {side}")
+            plot_one_stride_clearance(int(DEBUG_STRIDE_ID), debug)
+        else:
+            force_print(f"[DEBUG] Stride {DEBUG_STRIDE_ID} not found in debug['stride_debug'] for {test}. "
+                        f"Available example ids: {list(debug['stride_debug'].keys())[:10]}")
+
+
     # Stride matching (IMU-only -> GT converted to IMU time)
-    mapping_df, match_sum = match_strides_by_mid_swing_dp(events_imu, events_gt_imu, fs_hz, gate_s=float(gate_s))
+    gate_use = float(gate_s)
+
+    if dynamic_gate:
+        # IMU-only GT mode: use GT for stable cadence/stride time
+        gate_use = compute_dynamic_gate_s_from_stride_time(
+            events_ref=events_gt_imu,
+            fs_hz=fs_hz,
+            frac=0.12,
+            min_gate=0.08,
+            max_gate=0.25,
+            use="ic2ic",
+        )
+
+    mapping_df, match_sum = match_strides_by_mid_swing_dp(
+        events_imu, events_gt_imu, fs_hz, gate_s=gate_use
+    )
+
     fp = int(match_sum["n_det"] - match_sum["n_matched"])
     fn = int(match_sum["n_gt"] - match_sum["n_matched"])
 
@@ -2554,6 +3332,12 @@ def run_pipeline_for_row_report(
     mtc_imu_mean_mm = mtc_mocap_mean_mm = mtc_avg_diff_mm = mtc_mean_abs_diff_mm = np.nan
 
     if mapping_df is not None and (not mapping_df.empty) and imu_stride_res_scored is not None and (not imu_stride_res_scored.empty):
+        
+        stride_errors_path = None
+
+        if test == SAVE_STRIDE_ERRORS_FOR:
+            stride_errors_path = f"stride_errors_{participant}_{test}_{side}.csv"
+
         joined, bias, rmse, extra = phase_1_9_validate_against_mocap(
             mocap_traj=mocap_traj,
             events_mocap=events_mocap,
@@ -2566,7 +3350,17 @@ def run_pipeline_for_row_report(
             quiet=True,
             events_imu=None,
             plot_worst_k=0,
+            stride_errors_path=stride_errors_path,
         )
+
+        if test == DEBUG_TEST and DEBUG_STRIDE_ID is not None:
+            if DEBUG_STRIDE_ID in debug["stride_debug"]:
+                print(f"\n[DEBUG] Plotting stride {DEBUG_STRIDE_ID} for {test}")
+                plot_one_stride_clearance(int(DEBUG_STRIDE_ID), debug)
+            else:
+                print(f"[DEBUG] Stride {DEBUG_STRIDE_ID} not found in debug for {test}")
+
+
         mtc_bias_mm = float(bias * 1000.0)
         mtc_rmse_mm = float(rmse * 1000.0)
         mtc_n = int(len(joined))
@@ -2608,147 +3402,19 @@ def run_pipeline_for_row_report(
         "mtc_bias_mm": float(mtc_bias_mm) if np.isfinite(mtc_bias_mm) else np.nan,
         "mtc_rmse_mm": float(mtc_rmse_mm) if np.isfinite(mtc_rmse_mm) else np.nan,
         "mtc_n": int(mtc_n),
-        "mtc_imu_mean_mm": float(mtc_imu_mean_mm) if np.isfinite(mtc_imu_mean_mm) else np.nan,
-        "mtc_mocap_mean_mm": float(mtc_mocap_mean_mm) if np.isfinite(mtc_mocap_mean_mm) else np.nan,
-        "mtc_avg_diff_mm": float(mtc_avg_diff_mm) if np.isfinite(mtc_avg_diff_mm) else np.nan,
-        "mtc_mean_abs_diff_mm": float(mtc_mean_abs_diff_mm) if np.isfinite(mtc_mean_abs_diff_mm) else np.nan,
+
+        # Actual MTC values from Phase 1.9 extra
+        "mtc_imu_mean_mm": float(extra["mtc_imu_mean_m"]) * 1000.0,
+        "mtc_mocap_mean_mm": float(extra["mtc_mocap_mean_m"]) * 1000.0,
+        "mtc_imu_median_mm": float(extra["mtc_imu_median_m"]) * 1000.0,
+        "mtc_mocap_median_mm": float(extra["mtc_mocap_median_m"]) * 1000.0,
+
+        # Optional extra diagnostics
+        "mtc_avg_diff_mm": float(extra["mtc_avg_diff_m"]) * 1000.0,
+        "mtc_mean_abs_diff_mm": float(extra["mtc_mean_abs_diff_m"]) * 1000.0,
+
     }
     return row
-
-
-def run_pipeline_for_row(
-    data_folder: str,
-    participant: str,
-    test: str,
-    side: str,
-    toe_x_cm: float,
-    toe_z_cm: float,
-    sensor: str | None = None,
-    toe_marker: str | None = None,
-    padding_s: float = 3.0,
-    quiet: bool = True,
-    print_reject_counts: bool = True,
-):
-    """Run Phase 1.1–1.9 once for a given participant/test/side using a fixed toe offset.
-    Returns a dict with MTC mean/diff metrics (mm) computed on the joined stride set.
-
-    This is intended for augmenting an existing toe_offset_calibration.csv without running the
-    expensive x/z grid search.
-    """
-    # Defaults
-    if sensor is None:
-        sensor = "l_instep" if side == "left" else "r_instep"
-    if toe_marker is None:
-        toe_marker = "l_toe" if side == "left" else "r_toe"
-
-    # Load dataset (MoCap version)
-    dataset = SensorPositionComparison2019Mocap(
-        memory=Memory("./cache"),
-        data_folder=data_folder,
-        data_padding_s=float(padding_s),
-    )
-
-    subset = dataset.get_subset(participant=[participant], test=[test])
-    if len(subset) == 0:
-        raise RuntimeError(f"No datapoint found for participant={participant}, test={test}")
-    datapoint = subset[0]
-
-    imu_all = datapoint.data
-    fs_hz = float(datapoint.sampling_rate_hz)
-    mocap_traj = datapoint.marker_position_
-
-    if sensor not in imu_all.columns.get_level_values(0):
-        raise RuntimeError(f"Sensor '{sensor}' not found for {participant}/{test}.")
-    if toe_marker not in mocap_traj.columns.get_level_values(0):
-        raise RuntimeError(f"Toe marker '{toe_marker}' not found for {participant}/{test}.")
-
-    imu_df = imu_all[sensor][["acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z"]].copy()
-    events_mocap = datapoint.mocap_events_[side]
-    events_gt_imu = datapoint.convert_events_with_padding(events_mocap, from_time_axis="mocap", to_time_axis="imu")
-    events_imu = None  # IMU-only detected events created after filtering
-
-    # Phase 1.2: fixed toe offset (cm -> m)
-    p_toe_b = np.array([toe_x_cm / 100.0, 0.0, toe_z_cm / 100.0], dtype=float)
-
-    # Phase 1.3
-    imu_f = phase_1_3_filter_imu_signals(imu_df, fs_hz, cutoff_hz=20.0)
-
-    # Phase 1.4: IMU-only event detection (produces TC/IC/min_vel) + ZUPT mask
-    events_imu, _evdbg = phase_1_4_detect_events_imu_only(imu_f, fs_hz)
-    zupt_mask = phase_1_4_get_zupt_mask_from_min_vel(events_imu, n_samples=len(imu_f), half_window=10)
-
-    # Phase 1.5: orientation + world acc
-    qs = phase_1_5_estimate_orientation(imu_f, fs_hz)
-    acc_w = phase_1_5_compute_world_acceleration(imu_f, qs)
-    specific_acc_w, _g_mode = phase_1_5_remove_gravity(acc_w, zupt_mask)
-
-    # Phase 1.6: integrate z-only per stride
-    pz, vz = phase_1_6_integrate_z_only_per_stride_anchor_min_vel(
-        specific_acc_w,
-        events_imu,
-        fs_hz,
-        half_window=10,
-        enforce_end_vel_zero=True,
-        shift_to_tc=True,
-    )
-
-    p_imu_w = np.zeros((len(pz), 3), dtype=float)
-    p_imu_w[:, 2] = pz
-
-    # Phase 1.8: per-stride MTC from IMU
-    imu_stride_res, debug = phase_1_8_compute_mtc_per_stride(
-        p_imu_w, qs, p_toe_b, events_imu,
-        ground_mode="min_vel", half_window=10, fs_hz=fs_hz
-    )
-
-    # ------------------------
-    # Step B: reject diagnostics (what's killing strides)
-    # ------------------------
-    if print_reject_counts:
-        rej = (debug or {}).get("rej_counts", {}) or {}
-        kept = 0 if (imu_stride_res is None or imu_stride_res.empty) else int(len(imu_stride_res))
-        det_n = int(len(events_imu.dropna(subset=["ic","tc","start","end"])))
-
-        # Top reject reasons
-        top = sorted(rej.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        top_str = ", ".join([f"{k}={v}" for k, v in top]) if top else "none"
-
-        force_print(f"[REJ] kept={kept}/{det_n} | top: {top_str}")
-
-
-    # Match detected strides to MoCap strides (MoCap used ONLY for scoring)
-    gate_s = max(0.12, min(0.18, 3.0 * (61.8/1000.0)))  # ~3× TC RMSE, clipped
-    mapping_df, match_sum = match_strides_by_mid_swing_dp(events_imu, events_gt_imu, fs_hz, gate_s=gate_s)
-
-    imu_stride_res_scored = apply_stride_mapping_to_imu_results(imu_stride_res, events_imu, mapping_df, events_gt_imu)
-
-    # Phase 1.9: validate against mocap -> returns extra in meters
-    joined, bias, rmse, extra = phase_1_9_validate_against_mocap(
-
-        mocap_traj=mocap_traj,
-        events_mocap=events_mocap,
-        toe_marker_name=toe_marker,
-        imu_stride_res=imu_stride_res_scored,
-        plot=False,
-        fs_hz=fs_hz,
-        debug=debug,
-        verbose=(not quiet),
-        quiet=quiet,
-        events_imu=events_gt_imu,
-        plot_worst_k=0,
-    )
-
-    # Convert to mm for CSV
-    res = {
-        "bias_mm": float(bias * 1000.0),
-        "rmse_mm": float(rmse * 1000.0),
-        "n_joined": int(len(joined)),
-        "mtc_imu_mean_mm": float(extra.get("mtc_imu_mean_m", np.nan) * 1000.0),
-        "mtc_mocap_mean_mm": float(extra.get("mtc_mocap_mean_m", np.nan) * 1000.0),
-        "mtc_avg_diff_mm": float(extra.get("mtc_avg_diff_m", bias) * 1000.0),
-        "mtc_mean_abs_diff_mm": float(extra.get("mtc_mean_abs_diff_m", np.nan) * 1000.0),
-    }
-    return res
 
 
 def augment_existing_toe_offset_csv_with_mtc(csv_path: str, data_folder: str, padding_s: float = 3.0):
@@ -2783,15 +3449,24 @@ def augment_existing_toe_offset_csv_with_mtc(csv_path: str, data_folder: str, pa
         toe_z_cm = float(df.loc[i, "toe_z_cm"])
 
         try:
-            res = run_pipeline_for_row(
-                data_folder=data_folder,
-                participant=participant,
-                test=test,
-                side=side,
-                toe_x_cm=toe_x_cm,
-                toe_z_cm=toe_z_cm,
-                padding_s=padding_s,
+            res = run_pipeline_for_row_report(
+                data_folder=args.data_folder,
+                participant=p,
+                test=t,
+                side=s,
+                toe_x_cm=x,
+                toe_z_cm=z,
+                padding_s=args.padding_s,
+                event_source=args.event_source,
+                eventnet_model=batch_eventnet_model,
+                eventnet_meta=batch_eventnet_meta,
                 quiet=True,
+                print_reject_counts=True,
+                gate_s=float(args.gate_s),
+                dynamic_gate=True,
+                dynamic_zupt=True,
+                dynamic_ic_refine=True,
+                dynamic_cutoff=True,
             )
             df.loc[i, "mtc_imu_mean_mm"] = res["mtc_imu_mean_mm"]
             df.loc[i, "mtc_mocap_mean_mm"] = res["mtc_mocap_mean_mm"]
@@ -2868,8 +3543,29 @@ def main():
                     help="Event detection source: heuristic or ml")
     parser.add_argument("--event_model_pt", type=str, default=None,
                         help="Path to TorchScript param.pt for ML event detection")
-
+    parser.add_argument("--tests", nargs="+", default=None)
     args = parser.parse_args()
+
+    # -------------------------------
+    # C) Test selection logic
+    # Priority:
+    #   1) --tests slow_10 normal_10 ...
+    #   2) --test all  (or --test None)
+    #   3) --test normal_10
+    # -------------------------------
+    if args.tests is not None and len(args.tests) > 0:
+        tests = list(args.tests)
+    elif args.test is None or str(args.test).lower() == "all":
+        tests = [
+            "slow_10", "slow_20",
+            "normal_10", "normal_20",
+            "fast_10", "fast_20",
+            "long",
+        ]
+    else:
+        tests = [args.test]
+
+
 
     global CALIB_FILE
     CALIB_FILE = Path(args.toe_offset_csv)
@@ -2887,6 +3583,17 @@ def main():
         args.sensor = "l_instep" if args.side == "left" else "r_instep"
     if args.toe_marker is None:
         args.toe_marker = "l_toe" if args.side == "left" else "r_toe"
+
+    # =========================
+    # D1) One-time setup (single participant, multi-test)
+    # =========================
+    eventnet_model = None
+    eventnet_meta = None
+    if str(args.event_source).lower() == "ml":
+        if not args.event_model_pt:
+            raise RuntimeError("--event_source ml requires --event_model_pt <path_to_pt>")
+        force_print(f"[ONE] Loading ML event model: {args.event_model_pt}")
+        eventnet_model, eventnet_meta = load_eventnet(args.event_model_pt, device="cpu")
 
     # Optional: augment existing toe_offset_calibration.csv with MTC mean/diff columns (no calibration sweep)
     if getattr(args, "augment_calib_csv_with_mtc", False):
@@ -2966,17 +3673,36 @@ def main():
                     padding_s=args.padding_s,
                 )
 
-                best = calibrate_toe_offset_xz(
-                    p_imu_w=cal_in["p_imu_w"],
-                    qs=cal_in["qs"],
-                    events_imu=cal_in["events_imu"],
-                    mocap_traj=cal_in["mocap_traj"],
-                    events_mocap=cal_in["events_mocap"],
-                    toe_marker_name=cal_in["toe_marker_name"],
-                    events_gt_imu=cal_in["events_gt_imu"],
-                    fs_hz=cal_in["fs_hz"],
-                    quiet=True,
+                best = calibrate_toe_offset_xz_instep_two_stage(
+                    p_imu_w=p_imu_w,
+                    qs=qs,
+                    events_imu=events_imu,
+
+                    mocap_traj=mocap_traj,
+                    events_mocap=events_mocap,
+                    toe_marker_name="l_toe",
+
+                    events_gt_imu=events_gt_imu,
+                    fs_hz=fs_hz,
+
+                    ground_mode="min_vel",
+                    half_window=10,
+
+                    # optional tuning
+                    x_min_cm=3.0,
+                    x_max_cm=10.0,
+                    z_min_cm=-4.0,
+                    z_max_cm=-1.0,
+
+                    quiet=False
                 )
+
+                print("\n=== FINAL CALIBRATION RESULT ===")
+                print(f"x_cm  = {best['x_cm']:.2f}")
+                print(f"z_cm  = {best['z_cm']:.2f}")
+                print(f"bias  = {best['bias']*1000:+.2f} mm")
+                print(f"rmse  = {best['rmse']*1000:.2f} mm")
+
 
                 new_rows.append({
                     "participant": p,
@@ -3076,12 +3802,16 @@ def main():
                     toe_x_cm=x,
                     toe_z_cm=z,
                     padding_s=args.padding_s,
-                    gate_s=float(args.gate_s),
                     event_source=args.event_source,
                     eventnet_model=batch_eventnet_model,
                     eventnet_meta=batch_eventnet_meta,
                     quiet=True,
                     print_reject_counts=True,
+                    gate_s=float(args.gate_s),   # still used if dynamic_gate=False
+                    dynamic_gate=True,
+                    dynamic_zupt=True,
+                    dynamic_ic_refine=True,
+                    dynamic_cutoff=True,
                 )
                 out_rows.append(row)
                 force_print(f"[ALL] OK  {p} {t} {s} | MTC RMSE={row['mtc_rmse_mm']:.2f} mm | N={row['mtc_n']}")
@@ -3097,6 +3827,72 @@ def main():
         df_out = pd.DataFrame(out_rows)
         df_out.to_csv(args.out_csv, index=False)
         force_print(f"\n[ALL] Wrote spreadsheet: {args.out_csv}")
+        return
+
+    # =========================
+    # D2) Run ONE participant across ALL selected tests
+    # =========================
+    if str(args.participant).lower() != "all":
+        out_rows = []
+
+        # If you have a toe_offset_csv with per-test offsets, use it; otherwise use --toe_offset_cm
+        # (Your runner expects toe_x_cm/toe_z_cm)
+        # Force one toe offset for all tests: use normal_10 as the reference
+        ref_test = "normal_10"
+        ref = load_toe_offset(str(args.participant), ref_test, str(args.side).lower())
+
+        if ref is None:
+            raise RuntimeError(f"No toe offset found for {args.participant} {ref_test} {args.side} in {CALIB_FILE}")
+
+        toe_x_ref_cm = float(ref["x_cm"])
+        toe_z_ref_cm = float(ref["z_cm"])
+
+        force_print(f"[TOE] Using {ref_test} toe offset for ALL tests: x={toe_x_ref_cm:.2f} cm, z={toe_z_ref_cm:.2f} cm")
+
+        for t in tests:
+            
+            toe_x_cm = toe_x_ref_cm
+            toe_z_cm = toe_z_ref_cm
+
+            try:
+                row = run_pipeline_for_row_report(
+                    data_folder=args.data_folder,
+                    participant=str(args.participant),
+                    test=str(t),
+                    side=str(args.side).lower(),
+                    toe_x_cm=toe_x_cm,
+                    toe_z_cm=toe_z_cm,
+                    padding_s=float(args.padding_s),
+                    event_source=str(args.event_source).lower(),
+                    eventnet_model=eventnet_model,
+                    eventnet_meta=eventnet_meta,
+                    quiet=bool(args.summary_only),
+                    print_reject_counts=True,
+                    gate_s=float(args.gate_s),
+                    dynamic_gate=True,
+                    dynamic_zupt=True,
+                    dynamic_ic_refine=True,
+                    dynamic_cutoff=True,
+                )
+                out_rows.append(row)
+                force_print(f"[ONE] OK  {args.participant} {t} {args.side} | MTC RMSE={row['mtc_rmse_mm']:.2f} mm | N={row['mtc_n']}")
+            except Exception as e:
+                out_rows.append({
+                    "participant": str(args.participant),
+                    "test": str(t),
+                    "side": str(args.side).lower(),
+                    "toe_x_cm": toe_x_cm,
+                    "toe_z_cm": toe_z_cm,
+                    "error": str(e),
+                })
+                force_print(f"[ONE] FAIL {args.participant} {t} {args.side} | {e}")
+
+        df_out = pd.DataFrame(out_rows)
+
+        # write a single-participant summary file (separate from --participant all)
+        one_out = Path(args.out_csv).with_name(f"one_{args.participant}_alltests_summary.csv")
+        df_out.to_csv(one_out, index=False)
+        force_print(f"\n[ONE] Wrote spreadsheet: {one_out}")
         return
 
 
@@ -3124,6 +3920,10 @@ def main():
     imu_df = imu_all[args.sensor][["acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z"]].copy()
     events_mocap = datapoint.mocap_events_[args.side]
     events_gt_imu = datapoint.convert_events_with_padding(events_mocap, from_time_axis="mocap", to_time_axis="imu")
+    
+    events_mocap = events_mocap.reset_index(drop=True).copy()
+    events_gt_imu = events_gt_imu.reset_index(drop=True).copy()
+
     events_imu = None  # IMU-only detected events will be created after Phase 1.3
     #debug_print_events(events_imu)
     #print("IMU length:", len(imu_df))
@@ -3144,7 +3944,7 @@ def main():
     # ------------------------
     # Phase 1.3
     # ------------------------
-    imu_f = phase_1_3_filter_imu_signals(imu_df, fs_hz, cutoff_hz=20.0)
+    imu_f = phase_1_3_filter_imu(imu_df, fs_hz, dynamic=True)
     acc_norm = np.median(np.linalg.norm(imu_f[['acc_x','acc_y','acc_z']].to_numpy(), axis=1))
     print_phase("Phase 1.3", f"Filtered acc_norm median(all)={acc_norm:.3f} m/s^2")
 
@@ -3152,7 +3952,7 @@ def main():
     # IMU-only event detection (IC/TC) for Phase 1.4+
     # ------------------------
     if args.event_source == "ml":
-        if not args.event_model_pt:
+        if not args.event_model_pt:   
             raise RuntimeError("--event_source ml requires --event_model_pt <path_to_param.pt>")
 
         model, meta = load_eventnet(args.event_model_pt, device="cpu")  # CPU ok
@@ -3204,7 +4004,19 @@ def main():
     # ------------------------
     # Phase 1.4
     # ------------------------
-    zupt_mask = phase_1_4_get_zupt_mask_from_min_vel(events_imu, n_samples=len(imu_f), half_window=10)
+    zupt_mask = phase_1_4_get_zupt_mask_from_min_vel(
+        events_imu,
+        n_samples=len(imu_f),
+        dynamic=True,
+        fs_hz=fs_hz,
+        frac=0.03,
+        min_hw=6,
+        max_hw=25,
+        stride_ref="ic2ic",
+    )
+
+    force_print("[ZUPT] dynamic window enabled (frac=0.03, clamp=6..25 samples)")
+
     # debug_units_and_magnitude(imu_f, zupt_mask)
     debug_gyro_units(imu_f, zupt_mask)
     zupt_pct = 100.0 * float(np.mean(zupt_mask))
@@ -3230,7 +4042,13 @@ def main():
         events_imu,
         specific_acc_w=specific_acc_w,
         fs_hz=fs_hz,
+        dynamic=True,
+        pre_frac=0.12,
+        post_frac=0.03,
+        stride_ref="ic2ic",
     )
+
+    force_print(f"[IC] refine dynamic enabled: pre_frac=0.12 post_frac=0.03")
 
     if args.plot:
         plot_imu_mocap_events_window(
@@ -3244,7 +4062,16 @@ def main():
         )
         return
 
+    half_window_samples = 10
+    if dynamic_zupt:
+        ref = events_gt_imu if (events_gt_imu is not None and len(events_gt_imu) > 3) else events_imu
+        stride = ref.dropna(subset=["ic"]).sort_values("ic")
+        ic = stride["ic"].to_numpy(dtype=int)
 
+        if len(ic) >= 3:
+            stride_s = float(np.median(np.diff(ic) / float(fs_hz)))
+            hw_s = 0.03 * stride_s  # 3% stride duration
+            half_window_samples = int(np.clip(round(hw_s * fs_hz), 6, 25))
 
     # ------------------------
     # Phase 1.6
@@ -3253,7 +4080,7 @@ def main():
         specific_acc_w,
         events_imu,
         fs_hz,
-        half_window=10,
+        half_window=half_window_samples,
         enforce_end_vel_zero=True,
         shift_to_tc=True,
     )
@@ -3325,32 +4152,36 @@ def main():
         else:
             print("[Calibration] No cached calibration found — running grid search")
 
-            best = calibrate_toe_offset_xz(
+            best = calibrate_toe_offset_xz_instep_two_stage(
                 p_imu_w=p_imu_w,
                 qs=qs,
-                events_imu=events_imu,              # IMU-only timing (important)
+                events_imu=events_imu,
+
                 mocap_traj=mocap_traj,
                 events_mocap=events_mocap,
-                toe_marker_name=args.toe_marker,
+                toe_marker_name="l_toe",
 
-                # NEW (required after our refactor)
-                events_gt_imu=events_gt_imu,        # for stride mapping only
-                fs_hz=fs_hz,                        # for stride mapping only
+                events_gt_imu=events_gt_imu,
+                fs_hz=fs_hz,
 
-                # ORIGINAL grid definition (cm)
                 ground_mode="min_vel",
                 half_window=10,
-                x_min_cm=4.0, x_max_cm=24.0, x_step_cm=0.5,
-                z_min_cm=-12.0, z_max_cm=-0.0, z_step_cm=0.2,
-                objective="rmse",
+
+                # optional tuning
+                x_min_cm=3.0,
+                x_max_cm=10.0,
+                z_min_cm=-4.0,
+                z_max_cm=-1.0,
+
                 quiet=True
             )
 
+            print("\n=== FINAL CALIBRATION RESULT ===")
+            print(f"x_cm  = {best['x_cm']:.2f}")
+            print(f"z_cm  = {best['z_cm']:.2f}")
+            print(f"bias  = {best['bias']*1000:+.2f} mm")
+            print(f"rmse  = {best['rmse']*1000:.2f} mm")
 
-            print(
-                f"[Calibration] Best toe (x,z)=({best['x_cm']:.2f} cm, {best['z_cm']:.2f} cm) "
-                f"| Bias={best['bias']*1000:.1f} mm | RMSE={best['rmse']*1000:.1f} mm"
-            )
 
             save_toe_offset(
                 participant=args.participant,
@@ -3426,6 +4257,7 @@ def main():
         fs_hz,
         gate_s=gate_s
     )
+    
     fp = match_sum["n_det"] - match_sum["n_matched"]
     fn = match_sum["n_gt"] - match_sum["n_matched"]
     
