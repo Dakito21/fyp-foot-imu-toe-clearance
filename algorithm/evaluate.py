@@ -34,10 +34,7 @@ def main() -> None:
 
     ap.add_argument('--event_source', default='imu', choices=['imu', 'ml'])
     ap.add_argument('--event_model_pt', default=None)
-
-    ap.add_argument('--no_dynamic_cutoff', action='store_true')
     ap.add_argument('--no_dynamic_zupt', action='store_true')
-    ap.add_argument('--no_dynamic_ic_refine', action='store_true')
     ap.add_argument('--no_dynamic_gate', action='store_true')
 
     args = ap.parse_args()
@@ -89,14 +86,8 @@ def main() -> None:
         (str(r["participant"]), str(r["side"]).lower()): (float(r["toe_x_cm"]), float(r["toe_z_cm"]))
         for _, r in normal_df.iterrows()
     }
-
-
-    toggles = core.PipelineToggles(
-        dynamic_cutoff=not args.no_dynamic_cutoff,
-        dynamic_zupt=not args.no_dynamic_zupt,
-        dynamic_ic_refine=not args.no_dynamic_ic_refine,
-        dynamic_gate=not args.no_dynamic_gate,
-    )
+    # Pipeline is run in fully-dynamic mode
+    toggles = core.PipelineToggles(dynamic_cutoff=True, dynamic_zupt=True, dynamic_ic_refine=True, dynamic_gate=True)
 
     eventnet_model = None
     eventnet_meta = None

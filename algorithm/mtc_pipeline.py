@@ -41,211 +41,12 @@ ORIG_PRINT = builtins.print  # keep original
 
 from scipy.signal import butter, filtfilt
 
-def butter_lowpass_filter(x, fs_hz, cutoff_hz, order=4):
-    """
-    Zero-phase Butterworth low-pass filter.
-    """
-    import numpy as np
-
-    if cutoff_hz <= 0 or cutoff_hz >= 0.5 * fs_hz:
-        return x
-
-    nyq = 0.5 * fs_hz
-    wn = cutoff_hz / nyq
-    b, a = butter(order, wn, btype="low", analog=False)
-    return filtfilt(b, a, x)
-
-
 ##############################################################################
 # Logging & small helpers
 ##############################################################################
 
 def force_print(*args, **kwargs):
     ORIG_PRINT(*args, **kwargs)
-
-
-def mm(x):  # meters -> millimeters
-    return float(x) * 1000.0
-
-
-def print_phase(tag, msg, *, always=False):
-    """
-    Centralized phase printer.
-    - If SUMMARY_ONLY=True: prints only when always=True
-    - Otherwise: prints normally
-    """
-    if SUMMARY_ONLY and not always:
-        return
-    force_print(f"\n[{tag}] {msg}")
-
-
-def debug_gyro_units(imu_f, zupt_mask):
-    # ---- NEW: auto-detect gyro column names ----
-    cols = list(imu_f.columns)
-
-    gyro_candidates = [
-        ("gyro_x", "gyro_y", "gyro_z"),
-        ("gyr_x", "gyr_y", "gyr_z"),
-        ("wx", "wy", "wz"),
-        ("ang_vel_x", "ang_vel_y", "ang_vel_z"),
-    ]
-
-    gyro_cols = None
-    for triplet in gyro_candidates:
-        if all(c in cols for c in triplet):
-            gyro_cols = list(triplet)
-            break
-
-    if gyro_cols is None:
-        # Try partial match fallback
-        gx = next((c for c in cols if "gyr" in c and c.endswith(("x", "_x"))), None)
-        gy = next((c for c in cols if "gyr" in c and c.endswith(("y", "_y"))), None)
-        gz = next((c for c in cols if "gyr" in c and c.endswith(("z", "_z"))), None)
-        if gx and gy and gz:
-            gyro_cols = [gx, gy, gz]
-
-    if gyro_cols is None:
-        print("\n=== Debug: Gyro units check ===")
-        print("Could not find gyro columns in imu_f. Available columns:")
-        print(cols)
-        return
-
-    gnorm_all = np.linalg.norm(imu_f[gyro_cols].to_numpy(), axis=1)
-
-    gnorm_st = gnorm_all[zupt_mask] if zupt_mask is not None else np.array([])
-
-    print("\n=== Debug: Gyro units check ===")
-    print(f"gyro_norm median (all):   {np.median(gnorm_all):.3f}")
-
-    # ---- NEW: guard against empty stance ----
-    if gnorm_st.size == 0:
-        print("gyro_norm median (stance):nan (no stance/ZUPT samples)")
-        print("gyro_norm 95% (stance):   nan (no stance/ZUPT samples)")
-        print("Guide:")
-        print("- If typical values are ~0.1–3 -> likely rad/s")
-        print("- If typical values are ~10–300 -> likely deg/s")
-        print("NOTE: No stance detected; relax stride/stance gates or check detection.")
-        return
-
-    print(f"gyro_norm median (stance):{np.median(gnorm_st):.3f}")
-    print(f"gyro_norm 95% (stance):   {np.percentile(gnorm_st,95):.3f}")
-    print("Guide:")
-    print("- If typical values are ~0.1–3 -> likely rad/s")
-    print("- If typical values are ~10–300 -> likely deg/s")
-
-##############################################################################
-# Calibration CSV persistence (toe offsets)
-##############################################################################
-
-def load_toe_offset(participant, test, side):
-    if not CALIB_FILE.exists():
-        return None
-
-    with open(CALIB_FILE, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if (
-                row["participant"] == participant
-                and row["test"] == test
-                and row["side"] == side
-            ):
-                return {
-                    "x_cm": float(row["toe_x_cm"]),
-                    "z_cm": float(row["toe_z_cm"]),
-                    "bias_mm": float(row["bias_mm"]),
-                    "rmse_mm": float(row["rmse_mm"]),
-                    # Optional newer fields (backwards compatible with older CSVs)
-                    "mtc_imu_mean_mm": float(row.get("mtc_imu_mean_mm", "nan")),
-                    "mtc_mocap_mean_mm": float(row.get("mtc_mocap_mean_mm", "nan")),
-                    "mtc_avg_diff_mm": float(row.get("mtc_avg_diff_mm", row.get("bias_mm", "nan"))),
-                    "mtc_mean_abs_diff_mm": float(row.get("mtc_mean_abs_diff_mm", "nan")),
-                }
-    return None
-
-
-def save_toe_offset(participant, test, side, best):
-    """Append (or extend) toe_offset_calibration.csv with calibration + MTC summary metrics.
-
-    This function is backwards-compatible with an existing CSV that has only the old columns:
-    it rewrites the file with the union of columns so the new MTC fields appear without
-    requiring you to delete the CSV or re-run expensive x/z sweeps.
-    """
-    row = {
-        "participant": participant,
-        "test": test,
-        "side": side,
-        "toe_x_cm": round(float(best["x_cm"]), 2),
-        "toe_z_cm": round(float(best["z_cm"]), 2),
-        "bias_mm": round(float(best["bias"]) * 1000.0, 3),
-        "rmse_mm": round(float(best["rmse"]) * 1000.0, 3),
-
-        # Optional stride-level summary stats (may be missing if caller didn't pass them)
-        "mtc_imu_mean_mm": round(float(best.get("mtc_imu_mean_m", np.nan)) * 1000.0, 3)
-            if best.get("mtc_imu_mean_m", None) is not None else np.nan,
-        "mtc_mocap_mean_mm": round(float(best.get("mtc_mocap_mean_m", np.nan)) * 1000.0, 3)
-            if best.get("mtc_mocap_mean_m", None) is not None else np.nan,
-        # Signed average difference IMU - MoCap (mm). Equals bias when computed on the same joined set.
-        "mtc_avg_diff_mm": round(float(best.get("mtc_avg_diff_m", best.get("bias", np.nan))) * 1000.0, 3)
-            if best.get("mtc_avg_diff_m", None) is not None else round(float(best["bias"]) * 1000.0, 3),
-        "mtc_mean_abs_diff_mm": round(float(best.get("mtc_mean_abs_diff_m", np.nan)) * 1000.0, 3)
-            if best.get("mtc_mean_abs_diff_m", None) is not None else np.nan,
-    }
-
-    # Union-columns append (upgrades old CSV headers automatically)
-    csv_upsert_row_union_cols(str(CALIB_FILE), row)
-
-
-def csv_upsert_row_union_cols(csv_path: str, row: dict, key_cols=("participant","test","side")):
-    """
-    Upsert a row into csv_path:
-      - Union columns (backwards compatible)
-      - If a row with same key exists, REPLACE it (override)
-      - Otherwise append
-    """
-    import os
-    import pandas as pd
-
-    new_row = pd.DataFrame([row])
-
-    if os.path.exists(csv_path):
-        old = pd.read_csv(csv_path)
-
-        # union columns
-        for c in new_row.columns:
-            if c not in old.columns:
-                old[c] = pd.NA
-        for c in old.columns:
-            if c not in new_row.columns:
-                new_row[c] = pd.NA
-
-        # align order: keep old columns first, new at end
-        new_cols = [c for c in new_row.columns if c not in old.columns]
-        out_cols = list(old.columns) + new_cols
-        old = old[out_cols]
-        new_row = new_row[out_cols]
-
-        # build key mask
-        mask = None
-        for k in key_cols:
-            if k not in old.columns:
-                # if key cols missing for some reason, fallback to append
-                mask = None
-                break
-            m = (old[k].astype(str) == str(row[k]))
-            mask = m if mask is None else (mask & m)
-
-        if mask is not None and mask.any():
-            # replace FIRST match; drop other duplicates of same key
-            idxs = old.index[mask].tolist()
-            keep = old.drop(index=idxs[1:])  # drop duplicates beyond first
-            keep.loc[idxs[0]] = new_row.iloc[0]
-            out = keep
-        else:
-            out = pd.concat([old, new_row], ignore_index=True)
-    else:
-        out = new_row
-
-    out.to_csv(csv_path, index=False)
 
 ##############################################################################
 # Quaternion math
@@ -382,6 +183,20 @@ def _robust_mad(x: np.ndarray) -> float:
 # Signal processing / filtering
 ##############################################################################
 
+def butter_lowpass_filter(x, fs_hz, cutoff_hz, order=4):
+    """
+    Zero-phase Butterworth low-pass filter.
+    """
+    import numpy as np
+
+    if cutoff_hz <= 0 or cutoff_hz >= 0.5 * fs_hz:
+        return x
+
+    nyq = 0.5 * fs_hz
+    wn = cutoff_hz / nyq
+    b, a = butter(order, wn, btype="low", analog=False)
+    return filtfilt(b, a, x)
+
 def compute_dynamic_gate_s_from_stride_time(
     events_ref: pd.DataFrame,
     fs_hz: float,
@@ -415,14 +230,6 @@ def compute_dynamic_gate_s_from_stride_time(
     stride_time = float(np.median(dt))
     gate_s = frac * stride_time
     return float(np.clip(gate_s, min_gate, max_gate))
-
-
-def lowpass_df(df, fs_hz, cutoff_hz=20.0, order=4):
-    b, a = butter(order, cutoff_hz / (0.5 * fs_hz), btype="low", analog=False)
-    out = df.copy()
-    for col in df.columns:
-        out[col] = filtfilt(b, a, df[col].to_numpy())
-    return out
 
 def estimate_step_frequency_from_gyro_norm(gyr, fs_hz, fmin=0.5, fmax=4.0):
     import numpy as np
@@ -469,7 +276,6 @@ def estimate_step_frequency_from_gyro_norm(gyr, fs_hz, fmin=0.5, fmax=4.0):
         f_step = 1.5
     return float(np.clip(f_step, fmin, fmax))
 
-
 def dynamic_cutoffs_from_step_freq(f_step,
                                   acc_mult=8.0, gyr_mult=6.0,
                                   acc_lo=10.0, acc_hi=35.0,
@@ -481,7 +287,6 @@ def dynamic_cutoffs_from_step_freq(f_step,
     cutoff_acc = float(np.clip(acc_mult * f_step, acc_lo, acc_hi))
     cutoff_gyr = float(np.clip(gyr_mult * f_step, gyr_lo, gyr_hi))
     return cutoff_acc, cutoff_gyr
-
 
 def phase_1_3_filter_imu(imu, fs_hz, cutoff_hz=20.0, *, dynamic=False):
     """
@@ -495,15 +300,9 @@ def phase_1_3_filter_imu(imu, fs_hz, cutoff_hz=20.0, *, dynamic=False):
 
     if dynamic:
         gyr = imu_f[["gyr_x", "gyr_y", "gyr_z"]].to_numpy(dtype=float)
-        f_stride = estimate_step_frequency_from_gyro_norm(gyr, fs_hz)
-
-        # If estimator is actually giving stride frequency, convert to step frequency:
-        f_step = 2.0 * f_stride
-
+        f_step = estimate_step_frequency_from_gyro_norm(gyr, fs_hz)
         cutoff_acc, cutoff_gyr = dynamic_cutoffs_from_step_freq(f_step)
-
-        force_print(f"[FILTER] dynamic: f_stride={f_stride:.2f} Hz, f_step={f_step:.2f} Hz, "
-                    f"cutoff_acc={cutoff_acc:.1f} Hz, cutoff_gyr={cutoff_gyr:.1f} Hz")
+        force_print(f"[FILTER] dynamic: f_step={f_step:.2f} Hz, cutoff_acc={cutoff_acc:.1f} Hz, cutoff_gyr={cutoff_gyr:.1f} Hz")
     else:
         cutoff_acc = float(cutoff_hz)
         cutoff_gyr = float(cutoff_hz)
@@ -517,7 +316,6 @@ def phase_1_3_filter_imu(imu, fs_hz, cutoff_hz=20.0, *, dynamic=False):
         imu_f[k] = butter_lowpass_filter(imu_f[k].to_numpy(dtype=float), fs_hz, cutoff_hz=cutoff_gyr)
 
     return imu_f
-
 
 ##############################################################################
 # Event detection + stride filters + ZUPT
@@ -541,7 +339,6 @@ def _run_length_filter(mask: np.ndarray, min_len: int) -> np.ndarray:
             i += 1
     return out
 
-
 def _fill_small_gaps(mask: np.ndarray, max_gap: int) -> np.ndarray:
     """Fill False-gaps shorter than or equal to max_gap between True segments."""
     mask = mask.astype(bool)
@@ -563,7 +360,6 @@ def _fill_small_gaps(mask: np.ndarray, max_gap: int) -> np.ndarray:
             i += 1
     return out
 
-
 def _hysteresis_threshold(x: np.ndarray, low: float, high: float) -> np.ndarray:
     """
     Hysteresis comparator:
@@ -584,17 +380,14 @@ def _hysteresis_threshold(x: np.ndarray, low: float, high: float) -> np.ndarray:
         out[i] = state
     return out
 
-
 def _clamp(a, lo, hi):
     return max(lo, min(int(a), int(hi)))
-
 
 def _argmax_in_window(x: np.ndarray, a: int, b: int):
     if b <= a:
         return None
     j = int(np.argmax(x[a:b]))
     return a + j
-
 
 def phase_1_4b_filter_invalid_strides(events_imu: pd.DataFrame, fs_hz: float) -> pd.DataFrame:
     """
@@ -680,7 +473,6 @@ def phase_1_4b_filter_invalid_strides(events_imu: pd.DataFrame, fs_hz: float) ->
     ev = ev[ev["tc"].diff().fillna(1e9) > int(0.12 * fs_hz)]  # refractory 120 ms
 
     return ev
-
 
 def phase_1_4_detect_events_imu_only(
     imu_f: pd.DataFrame,
@@ -1050,8 +842,6 @@ def phase_1_4_detect_events_imu_only(
     }
     return events_imu, debug
 
-
-
 #For ML-based event detection
 
 class _ConvBlock(nn.Module):
@@ -1355,7 +1145,7 @@ def refine_ic_with_specific_acc(
       - set early-pull limit as fraction of stride duration (with clamps)
     """
     n = len(specific_acc_w)
-    feat = np.abs(specific_acc_w[:, 2])  # vertical specific accel magnitude
+    az = specific_acc_w[:, 2] 
 
     out = events_imu.copy()
     if "ic" not in out.columns or out["ic"].isna().all():
@@ -1389,18 +1179,23 @@ def refine_ic_with_specific_acc(
         pos = int(r["_pos"])
         ic0 = int(r["ic"])
 
-        if not dynamic:
-            ...
-            ic_refined.append(ic_new)
-            continue
-
-        # --- dynamic windows based on stride length ---
         ss = stride_samples[pos] if np.isfinite(stride_samples[pos]) else med_stride
+        if not np.isfinite(ss) or ss <= 0:
+            ss = int(1.0 * fs_hz)
 
-        pre_s_i = float(np.clip(pre_frac * ss / fs_hz, pre_bounds_s[0], pre_bounds_s[1]))
-        post_s_i = float(np.clip(post_frac * ss / fs_hz, post_bounds_s[0], post_bounds_s[1]))
+        # Fix B insertion (cadence-adaptive fracs)
+        stride_s = ss / fs_hz
+        if stride_s >= 1.25:
+            pre_frac_eff = 0.20; post_frac_eff = 0.03; max_early_pull_frac_eff = 0.05
+        elif stride_s >= 1.10:
+            pre_frac_eff = 0.16; post_frac_eff = 0.03; max_early_pull_frac_eff = 0.04
+        else:
+            pre_frac_eff = pre_frac; post_frac_eff = post_frac; max_early_pull_frac_eff = max_early_pull_frac
 
-        w_pre = int(round(pre_s_i * fs_hz))
+        pre_s_i  = float(np.clip(pre_frac_eff  * ss / fs_hz, pre_bounds_s[0],  pre_bounds_s[1]))
+        post_s_i = float(np.clip(post_frac_eff * ss / fs_hz, post_bounds_s[0], post_bounds_s[1]))
+
+        w_pre  = int(round(pre_s_i  * fs_hz))
         w_post = int(round(post_s_i * fs_hz))
 
         a = max(0, ic0 - w_pre)
@@ -1409,15 +1204,44 @@ def refine_ic_with_specific_acc(
             ic_refined.append(ic0)
             continue
 
-        ic_new = a + int(np.argmax(feat[a:b]))
+        seg = az[a:b]
+        k_max = a + int(np.argmax(seg))
+        k_min = a + int(np.argmin(seg))
 
+        def sharpness_at(k):
+            w = int(round(0.02 * fs_hz))
+            aa = max(0, k - w); bb = min(n, k + w + 1)
+            return float(np.abs(az[k] - np.median(az[aa:bb])))
+
+        k1 = k_max if sharpness_at(k_max) >= sharpness_at(k_min) else k_min
+        ic_new = k1
+
+
+        # Clamp first (early/late)
         max_early_pull_s = float(np.clip(
-            max_early_pull_frac * ss / fs_hz,
+            max_early_pull_frac_eff * ss / fs_hz,
             max_early_pull_bounds_s[0],
             max_early_pull_bounds_s[1],
         ))
         max_early_pull = int(round(max_early_pull_s * fs_hz))
         ic_new = max(ic_new, ic0 - max_early_pull)
+
+        max_late_push = int(round(0.03 * fs_hz))
+        ic_new = min(ic_new, ic0 + max_late_push)
+
+        # Sharpness gate at the FINAL ic_new
+        k = ic_new
+        w = int(round(0.02 * fs_hz))
+        aa = max(0, k - w)
+        bb = min(n, k + w + 1)
+        local = az[aa:bb]
+        sharp = float(az[k] - np.median(local))
+
+        # looser threshold for slow strides
+        thr = 0.7 if stride_s >= 1.10 else 1.0
+        if sharp < thr:
+            ic_refined.append(ic0)
+            continue
 
         ic_refined.append(ic_new)
 
@@ -1450,16 +1274,6 @@ def phase_1_4_get_zupt_mask_from_min_vel(
     if ev.empty:
         return zupt
 
-    if not dynamic:
-        hw = int(half_window)
-        for _, row in ev.iterrows():
-            mv = int(row["min_vel"])
-            a = max(0, mv - hw)
-            b = min(n_samples, mv + hw + 1)
-            zupt[a:b] = True
-        return zupt
-
-    # --- dynamic mode ---
     if fs_hz is None or fs_hz <= 0:
         fs_hz = 200.0  # fallback
 
@@ -1724,10 +1538,9 @@ def phase_1_5b_stance_attitude_correction(
         best_i = int(np.argmax(scores))
         q_curr_new = _quat_norm(cand[best_i])
 
-        # Optional: only accept if it improves
         if scores[best_i] > score0 + 1e-3:
-            q_curr = q_curr_new
-        # else: skip update (window not trustworthy)
+            q_curr = _quat_norm(cand[best_i])
+        # else: keep q_curr unchanged
 
         # Update cumulative correction
         q_curr = quat_mul(q_curr, q_corr_b)
@@ -1750,8 +1563,6 @@ def phase_1_5b_stance_attitude_correction(
 
     return qs_corr
 
-
-
 def phase_1_5_compute_world_acceleration(imu_f, qs):
     """
     (1.5) Rotate body-frame acceleration into the world frame.
@@ -1770,32 +1581,46 @@ def phase_1_5_compute_world_acceleration(imu_f, qs):
 
     return acc_w
 
-
-def phase_1_5_remove_gravity(acc_w, zupt_mask):
-    """
-    Remove gravity assuming world Z is correct.
-
-    We estimate gravity magnitude from stance samples,
-    but always subtract along world Z direction.
-    """
+def phase_1_5_remove_gravity(acc_w, zupt_mask, fs_hz=200.0, tau_s=1.5):
+    n = len(acc_w)
 
     if zupt_mask is None or (not np.any(zupt_mask)):
-        g_mag = float(np.median(np.linalg.norm(acc_w, axis=1)))
-        ref = "all"
-    else:
-        g_mag = float(np.median(np.linalg.norm(acc_w[zupt_mask], axis=1)))
-        ref = "stance"
+        g_hat = np.median(acc_w, axis=0)
+        specific_acc_w = acc_w - g_hat
+        print(f"[Phase 1.5] Gravity removal: global median(all) | g_hat={g_hat} | |g_hat|={np.linalg.norm(g_hat):.3f}")
+        return specific_acc_w, "acc_w - global g_hat"
+    
+    # Build time-varying g_hat: only update from stance samples, then smooth
+    g_series = np.zeros_like(acc_w)
+    g_series[:] = np.nan
+    g_series[zupt_mask] = acc_w[zupt_mask]
 
-    # Force gravity direction to world Z
-    g_vec = np.array([0.0, 0.0, g_mag], dtype=float)
+    # forward-fill + back-fill NaNs
+    for j in range(3):
+        col = g_series[:, j]
+        # ffill
+        last = np.nan
+        for i in range(n):
+            if np.isfinite(col[i]): last = col[i]
+            else: col[i] = last
+        # bfill
+        last = np.nan
+        for i in range(n-1, -1, -1):
+            if np.isfinite(col[i]): last = col[i]
+            else: col[i] = last
+        g_series[:, j] = col
 
-    specific_acc_w = acc_w - g_vec
+    # Smooth with EMA
+    alpha = 1.0 - np.exp(-1.0 / (tau_s * fs_hz))
+    g_hat_t = np.zeros_like(acc_w)
+    g_hat_t[0] = g_series[0]
+    for i in range(1, n):
+        g_hat_t[i] = (1 - alpha) * g_hat_t[i-1] + alpha * g_series[i]
 
-    print(f"[Phase 1.5] Gravity removal mode: acc_w - [0,0,g_mag] "
-          f"(median {ref}) | g_mag={g_mag:.3f}")
-
-    return specific_acc_w, "acc_w - fixed-Z gravity"
-
+    specific_acc_w = acc_w - g_hat_t
+    g0 = g_hat_t[int(np.argmax(zupt_mask))]  # representative print
+    print(f"[Phase 1.5] Gravity removal: time-varying g_hat(stance EMA, tau={tau_s:.1f}s) | g_hat~{g0} | |g_hat|~{np.linalg.norm(g0):.3f}")
+    return specific_acc_w, "acc_w - g_hat(t)"
 
 ##############################################################################
 # Integration / kinematics
@@ -1930,7 +1755,6 @@ def phase_1_6_integrate_z_only_per_stride_anchor_min_vel(
 
     return pz, vz
 
-
 ##############################################################################
 # MTC computation
 ##############################################################################
@@ -1952,7 +1776,6 @@ def phase_1_1_define_mtc_objective():
         "ground_definition": "stance_median_toe_z"
     }
 
-
 def phase_1_2_define_virtual_toe_point(toe_offset_cm):
     """
     (1.2) Virtual toe point definition (no shoe scan):
@@ -1960,7 +1783,6 @@ def phase_1_2_define_virtual_toe_point(toe_offset_cm):
     """
     toe_offset_m = np.array(toe_offset_cm, dtype=float) / 100.0
     return toe_offset_m
-
 
 def phase_1_8_compute_mtc_per_stride(p_imu_w, qs, p_toe_b, events_imu, ground_mode="min_vel", half_window=10, fs_hz=None):
     n = len(p_imu_w)
@@ -2066,12 +1888,6 @@ def phase_1_8_compute_mtc_per_stride(p_imu_w, qs, p_toe_b, events_imu, ground_mo
 
         _, ground_mode_used, gw_a, gw_b, ground_win, ground_sigma_hat, ground_iqr = best
 
-        if s_id < 3:  # only first few strides to avoid spam
-            force_print(
-                f"[GROUND] s_id={s_id} mode={ground_mode_used} "
-                f"len={gw_b-gw_a} sigma={ground_sigma_hat*1000:.1f}mm iqr={ground_iqr*1000:.1f}mm "
-                f"(ic={ic}, end={end}, stance_len={end-ic})"
-            )
 
 
         x = np.arange(len(ground_win), dtype=float)
@@ -2085,23 +1901,68 @@ def phase_1_8_compute_mtc_per_stride(p_imu_w, qs, p_toe_b, events_imu, ground_mo
         else:
             ground = float(np.median(ground_win))
 
-
-
-
         # --- Swing window: compute MTC (simple + non-lethal) ---
-        # Optional small trim to reduce TC/IC edge artifacts; set trim=0 to fully disable
-        trim = int(round(0.005 * fs_hz))  # 5 ms
-        trim = min(trim, int(0.10 * (ic - tc)))  # don’t over-trim short swings
+        swing_len = ic - tc
+        trim_lo = int(round(max(0.05*fs_hz, 0.10*swing_len)))  # 50ms or 10% swing
+        trim_hi = int(round(max(0.05*fs_hz, 0.10*swing_len)))
 
-        a_sw = tc + trim
-        b_sw = ic - trim
-        if b_sw <= a_sw + 5:
-            REJ("swing_too_short")
-            continue
+        a_sw = tc + trim_lo
+        b_sw = ic - trim_hi
+        if b_sw <= a_sw + int(0.05*fs_hz):
+            # fallback: your old tiny trim if swing is short
+            t = min(int(round(0.005*fs_hz)), int(0.10*swing_len))
+            a_sw = tc + t
+            b_sw = ic - t
 
-        swing_clearance = toe_z[a_sw:b_sw] - ground
-        mtc = float(np.min(swing_clearance))
-        mtc_idx = a_sw + int(np.argmin(swing_clearance))
+        seg = toe_z[a_sw:b_sw] - ground
+
+        # Light smoothing for candidate finding ONLY (keep raw value for reporting)
+        w = max(5, int(round(0.015 * fs_hz)))  # ~15 ms
+        w = w + 1 if (w % 2 == 0) else w
+        kernel = np.ones(w) / w
+        seg_s = np.convolve(seg, kernel, mode="same")
+
+        # Find K lowest candidates from smoothed (robust to noise)
+        K = 5
+        cand_idx = np.argsort(seg_s)[:K]
+
+        best_k = None
+        best_score = None
+        for ci in cand_idx:
+            k = a_sw + int(ci)
+
+            # slope check on RAW clearance around k
+            w2 = int(round(0.02 * fs_hz))  # 20 ms
+            aa = max(a_sw, k - w2)
+            bb = min(b_sw, k + w2 + 1)
+            local = toe_z[aa:bb] - ground
+
+            if len(local) < 5:
+                continue
+
+            # Compute slope in m/s (normalized by dt)
+            dt = 1.0 / fs_hz
+            d = np.diff(local)
+            if len(d) == 0:
+                continue
+
+            slope = float(np.median(np.abs(d)) / dt)  # m/s
+
+            raw_clear = float(seg[ci])
+            score = raw_clear + 0.02 * slope  # tune weight if needed
+
+            if (best_score is None) or (score < best_score):
+                best_score = score
+                best_k = k
+
+        if best_k is None:
+            # fallback to original
+            mtc = float(np.min(seg))
+            mtc_idx = a_sw + int(np.argmin(seg))
+        else:
+            mtc_idx = best_k
+            mtc = float(toe_z[mtc_idx] - ground)
+
         mtc_rel_pct = (mtc_idx - tc) / max(1, (ic - tc))
 
         # Log edge-min tendency (do NOT reject)
@@ -2229,7 +2090,6 @@ def dp_monotone_match(
     pairs.reverse()
     return pairs
 
-
 def match_strides_by_mid_swing_dp(
     events_det: pd.DataFrame,
     events_gt_imu: pd.DataFrame,
@@ -2284,7 +2144,6 @@ def match_strides_by_mid_swing_dp(
         "stride_recall": float(n_matched / max(1, len(gt))),
     }
     return mapping_df, summary
-
 
 def apply_stride_mapping_to_imu_results(
     imu_stride_res: pd.DataFrame,
@@ -2353,7 +2212,6 @@ def plot_one_stride_clearance(s_id, debug):
     plt.grid(True)
     plt.legend()
     plt.show(block=True)
-
 
 def plot_imu_mocap_events_window(
     imu_f: pd.DataFrame,
@@ -2430,7 +2288,6 @@ def plot_imu_mocap_events_window(
     plt.tight_layout()
     plt.show()
 
-
 def phase_1_9_validate_against_mocap(
     mocap_traj,
     events_mocap,
@@ -2479,16 +2336,16 @@ def phase_1_9_validate_against_mocap(
         else:
             ground = float(np.median(toe_z[ic:end]))
 
-        # ---- Enforce toe_z(ic-) = ground by shifting swing only ----
-        toe_z_end = toe_z[ic - 1] - ground
+       # use local copy for this stride only
+        swing_seg = toe_z[tc:ic].copy()
+        # enforce end closure on the swing copy only
+        toe_z_end = swing_seg[-1] - ground
         L = (ic - 1) - tc
         if L > 0:
-            for i in range(tc, ic):
-                frac = (i - tc) / float(L)
-                toe_z[i] -= frac * toe_z_end
+            frac = np.linspace(0.0, 1.0, swing_seg.size)
+            swing_seg = swing_seg - frac * toe_z_end
 
-        swing_clearance = toe_z[tc:ic] - ground
-
+        swing_clearance = swing_seg - ground
         mtc = float(np.min(swing_clearance))
 
         gt_rows.append({"s_id": s_id, "mtc_mocap_m": mtc})
@@ -2808,292 +2665,8 @@ def phase_1_9_validate_against_mocap(
     return joined, bias, rmse, extra
 
 ##############################################################################
-# Toe-offset calibration (grid search)
-##############################################################################
-
-def calibrate_toe_offset_z(
-    p_imu_w, qs, events_imu,
-    mocap_traj, events_mocap,
-    toe_marker_name,
-    ground_mode="min_vel", half_window=10,
-    z_min_cm=-12.0, z_max_cm=-2.0, step_cm=0.1,
-    objective="rmse_plus_bias", verbose=False
-):
-    best = None
-
-    for z_cm in np.arange(z_min_cm, z_max_cm + 1e-9, step_cm):
-        p_toe_b = np.array([0.20, 0.0, z_cm/100.0])
-
-        imu_stride_res, _ = phase_1_8_compute_mtc_per_stride(
-            p_imu_w, qs, p_toe_b, events_imu,
-            ground_mode=ground_mode,
-            half_window=half_window
-        )
-
-        joined, bias, rmse, extra = phase_1_9_validate_against_mocap(
-            mocap_traj=mocap_traj,
-            events_mocap=events_mocap,
-            toe_marker_name=toe_marker_name,
-            imu_stride_res=imu_stride_res,
-            plot=False,
-            quiet=True,     # <- suppress prints + CSV
-            verbose=False,  # <- suppress summary too
-            ground_mode=ground_mode,
-            half_window=half_window
-        )
-
-        if objective == "abs_bias":
-            score = abs(bias)
-        elif objective == "rmse":
-            score = rmse
-        else:
-            score = rmse + 0.5*abs(bias)
-
-        if verbose:
-            print(f"[Cal] z_cm={z_cm:6.2f}  bias={bias*1000:+6.2f} mm  rmse={rmse*1000:6.2f} mm  score={score:.6f}")
-
-        if best is None or score < best["score"]:
-            best = {
-                "z_cm": float(z_cm),
-                "bias": float(bias),
-                "rmse": float(rmse),
-                "score": float(score),
-                # Keep stride-level mean metrics for logging/CSV
-                **(extra or {}),
-            }
-
-    return best
-
-
-def calibrate_toe_offset_xz(
-    p_imu_w, qs, events_imu,
-    mocap_traj, events_mocap,
-    toe_marker_name,
-    events_gt_imu, fs_hz,
-    ground_mode="min_vel", half_window=10,
-    x_min_cm=4.0, x_max_cm=24.0, x_step_cm=0.5,
-    z_min_cm=-12.0, z_max_cm=0.0, z_step_cm=0.2,
-    objective="rmse",
-    quiet=False
-):
-    """
-    Grid-search toe (x,z) offset using MoCap to minimize stride-level MTC error.
-    Returns best dict with x_cm, z_cm, bias, rmse, score.
-
-    x_grid = np.arange(x_min_cm, x_max_cm + 1e-9, x_step_cm) / 100.0
-    z_grid = np.arange(z_min_cm, z_max_cm + 1e-9, z_step_cm) / 100.0
-
-    """
-    best = None
-    
-    # Compute stride mapping ONCE (independent of toe offset)
-    mapping_df, match_sum = match_strides_by_mid_swing_dp(
-        events_imu, events_gt_imu, fs_hz, gate_s=0.25
-    )
-    if mapping_df.empty:
-        raise RuntimeError(
-            f"Calibration: no stride matches (det={match_sum['n_det']} gt={match_sum['n_gt']}). "
-            "Cannot calibrate toe offset."
-        )
-
-
-    # Precompute MoCap MTC once (independent of IMU toe offset)
-    # We'll reuse your Phase 1.9 method by calling it with plot=False, quiet=True.
-    for x_cm in np.arange(x_min_cm, x_max_cm + 1e-9, x_step_cm):
-        for z_cm in np.arange(z_min_cm, z_max_cm + 1e-9, z_step_cm):
-            p_toe_b = np.array([x_cm/100.0, 0.0, z_cm/100.0])
-
-            imu_stride_res, _ = phase_1_8_compute_mtc_per_stride(
-                p_imu_w, qs, p_toe_b, events_imu,
-                ground_mode=ground_mode,
-                half_window=half_window
-            )
-
-            # ------------------------------------------------------------
-            # STEP 3: Map IMU strides to MoCap stride IDs (once per grid point)
-            # ------------------------------------------------------------
-            imu_stride_res_scored = apply_stride_mapping_to_imu_results(
-                imu_stride_res,
-                events_imu,
-                mapping_df,        # computed ONCE at top of function
-                events_gt_imu
-            )
-
-            if imu_stride_res_scored.empty:
-                continue
-
-            joined, bias, rmse, extra = phase_1_9_validate_against_mocap(
-                mocap_traj=mocap_traj,
-                events_mocap=events_mocap,
-                toe_marker_name=toe_marker_name,
-                imu_stride_res=imu_stride_res_scored,   # IMPORTANT
-                plot=False,
-                quiet=True,
-                verbose=False,
-                ground_mode=ground_mode,
-                half_window=half_window,
-                events_imu=None
-            )
-
-
-
-            if objective == "abs_bias":
-                score = abs(bias)
-            elif objective == "rmse":
-                score = rmse
-            else:
-                score = rmse + 0.5*abs(bias)
-
-            if not quiet:
-                print(f"[CalXZ] x_cm={x_cm:5.1f} z_cm={z_cm:6.2f}  bias={bias*1000:+6.2f}mm  rmse={rmse*1000:6.2f}mm  score={score:.6f}")
-
-            if best is None or score < best["score"]:
-                best = {
-                    "x_cm": float(x_cm),
-                    "z_cm": float(z_cm),
-                    "bias": float(bias),
-                    "rmse": float(rmse),
-                    "score": float(score),
-                    # Keep stride-level mean metrics for logging/CSV
-                    **(extra or {}),
-                }
-
-    return best
-
-def calibrate_toe_offset_fast(
-    p_imu_w, qs, events_imu,
-    events_gt_imu,
-    mocap_traj, events_mocap,
-    toe_marker_name,
-    fs_hz,
-    half_window
-):
-    # ---- Precompute stride mapping ONCE ----
-    mapping_df, _ = match_strides_by_mid_swing_dp(
-        events_imu, events_gt_imu, fs_hz, gate_s=0.20
-    )
-
-    # ---- Coarse grid ----
-    x_grid = np.arange(6, 22.1, 1.0)
-    z_grid = np.arange(-12, -1.9, 0.5)
-
-    best = None
-
-    for x_cm in x_grid:
-        for z_cm in z_grid:
-
-            p_toe_b = np.array([x_cm/100.0, 0.0, z_cm/100.0])
-
-            imu_stride_res, _ = phase_1_8_compute_mtc_per_stride(
-                p_imu_w, qs, p_toe_b, events_imu,
-                ground_mode="min_vel",
-                half_window=half_window
-            )
-
-            imu_scored = apply_stride_mapping_to_imu_results(
-                imu_stride_res, events_imu,
-                mapping_df, events_gt_imu
-            )
-
-            if imu_scored is None or imu_scored.empty:
-                continue
-
-            _, bias, rmse, _ = phase_1_9_validate_against_mocap(
-                mocap_traj=mocap_traj,
-                events_mocap=events_mocap,
-                toe_marker_name=toe_marker_name,
-                imu_stride_res=imu_scored,
-                plot=False,
-                quiet=True
-            )
-
-            score = rmse
-
-            if best is None or score < best["score"]:
-                best = {"x_cm": x_cm, "z_cm": z_cm, "score": score}
-
-    # ---- Fine search around best ----
-    x_fine = np.arange(best["x_cm"]-2, best["x_cm"]+2.1, 0.2)
-    z_fine = np.arange(best["z_cm"]-1.5, best["z_cm"]+1.6, 0.1)
-
-    for x_cm in x_fine:
-        for z_cm in z_fine:
-            # same evaluation logic (omitted here for brevity)
-            pass
-
-    return best
-
-
-##############################################################################
 # Pipeline runners (single participant/test)
 ##############################################################################
-
-def build_calibration_inputs(data_folder: str, participant: str, test: str, side: str, padding_s: float = 3.0):
-    """
-    Build the required inputs for calibrate_toe_offset_xz():
-    returns dict with p_imu_w, qs, events_imu, mocap_traj, events_mocap, toe_marker_name, events_gt_imu, fs_hz
-    """
-    side = str(side).lower()
-    sensor = "l_instep" if side == "left" else "r_instep"
-    toe_marker = "l_toe" if side == "left" else "r_toe"
-
-    dataset = SensorPositionComparison2019Mocap(
-        memory=Memory("./cache"),
-        data_folder=data_folder,
-        data_padding_s=float(padding_s),
-    )
-    subset = dataset.get_subset(participant=[participant], test=[test])
-    if len(subset) == 0:
-        raise RuntimeError(f"No datapoint found for participant={participant}, test={test}")
-    datapoint = subset[0]
-
-    imu_all = datapoint.data
-    fs_hz = float(datapoint.sampling_rate_hz)
-    mocap_traj = datapoint.marker_position_
-    events_mocap = datapoint.mocap_events_[side]
-    events_gt_imu = datapoint.convert_events_with_padding(events_mocap, from_time_axis="mocap", to_time_axis="imu")
-
-    imu_df = imu_all[sensor][["acc_x","acc_y","acc_z","gyr_x","gyr_y","gyr_z"]].copy()
-
-    imu_f = phase_1_3_filter_imu(imu_df, fs_hz, cutoff_hz=20.0)
-
-    events_imu, _evdbg = phase_1_4_detect_events_imu_only(imu_f, fs_hz)
-    events_imu = phase_1_4b_filter_invalid_strides(events_imu, fs_hz)
-    if events_imu is None or len(events_imu) == 0:
-        raise RuntimeError("No valid IMU strides after detection/filtering.")
-
-    zupt_mask = phase_1_4_get_zupt_mask_from_min_vel(events_imu, n_samples=len(imu_f), half_window=10)
-
-    qs = phase_1_5_estimate_orientation(imu_f, fs_hz)
-    acc_w = phase_1_5_compute_world_acceleration(imu_f, qs)
-    specific_acc_w, _ = phase_1_5_remove_gravity(acc_w, zupt_mask)
-
-    # refine IC (important for consistent swing window)
-    events_imu = refine_ic_with_specific_acc(events_imu, specific_acc_w=specific_acc_w, fs_hz=fs_hz)
-
-    # vertical integration (z only)
-    pz, vz = phase_1_6_integrate_z_only_per_stride_anchor_min_vel(
-        specific_acc_w,
-        events_imu,
-        fs_hz,
-        half_window=10,
-        enforce_end_vel_zero=True,
-        shift_to_tc=True,
-    )
-    p_imu_w = np.zeros((len(pz), 3), dtype=float)
-    p_imu_w[:, 2] = pz
-
-    return {
-        "p_imu_w": p_imu_w,
-        "qs": qs,
-        "events_imu": events_imu,
-        "mocap_traj": mocap_traj,
-        "events_mocap": events_mocap,
-        "toe_marker_name": toe_marker,
-        "events_gt_imu": events_gt_imu,
-        "fs_hz": fs_hz,
-    }
-
 
 def run_pipeline_for_row_report(
     data_folder: str,
@@ -3243,7 +2816,7 @@ def run_pipeline_for_row_report(
         fs_hz=fs_hz,
         dynamic=dynamic_ic_refine,
         pre_frac=0.12,
-        post_frac=0.08,
+        post_frac=0.03,
         stride_ref="ic2ic",
     )
 
@@ -3415,967 +2988,3 @@ def run_pipeline_for_row_report(
 
     }
     return row
-
-
-def augment_existing_toe_offset_csv_with_mtc(csv_path: str, data_folder: str, padding_s: float = 3.0):
-    """Augment an existing toe_offset_calibration.csv by computing MTC mean/diff for each row.
-
-    Does NOT run any toe offset calibration sweep. Uses toe_x_cm/toe_z_cm already stored per row.
-    Overwrites the same CSV with new columns appended and populated.
-    """
-    df = pd.read_csv(csv_path)
-
-    # Add new columns if missing
-    new_cols = [
-        "mtc_imu_mean_mm",
-        "mtc_mocap_mean_mm",
-        "mtc_avg_diff_mm",
-        "mtc_mean_abs_diff_mm",
-        "mtc_n_strides",
-    ]
-    for c in new_cols:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    # Process all rows (or only missing)
-    for i in range(len(df)):
-        if not pd.isna(df.loc[i, "mtc_avg_diff_mm"]):
-            continue
-
-        participant = str(df.loc[i, "participant"])
-        test = str(df.loc[i, "test"])
-        side = str(df.loc[i, "side"]).lower()
-        toe_x_cm = float(df.loc[i, "toe_x_cm"])
-        toe_z_cm = float(df.loc[i, "toe_z_cm"])
-
-        try:
-            res = run_pipeline_for_row_report(
-                data_folder=args.data_folder,
-                participant=p,
-                test=t,
-                side=s,
-                toe_x_cm=x,
-                toe_z_cm=z,
-                padding_s=args.padding_s,
-                event_source=args.event_source,
-                eventnet_model=batch_eventnet_model,
-                eventnet_meta=batch_eventnet_meta,
-                quiet=True,
-                print_reject_counts=True,
-                gate_s=float(args.gate_s),
-                dynamic_gate=True,
-                dynamic_zupt=True,
-                dynamic_ic_refine=True,
-                dynamic_cutoff=True,
-            )
-            df.loc[i, "mtc_imu_mean_mm"] = res["mtc_imu_mean_mm"]
-            df.loc[i, "mtc_mocap_mean_mm"] = res["mtc_mocap_mean_mm"]
-            df.loc[i, "mtc_avg_diff_mm"] = res["mtc_avg_diff_mm"]
-            df.loc[i, "mtc_mean_abs_diff_mm"] = res["mtc_mean_abs_diff_mm"]
-            df.loc[i, "mtc_n_strides"] = res["n_joined"]
-            print(f"[AUGMENT] {participant} {test} {side}: Avg diff={res['mtc_avg_diff_mm']:.2f} mm | N={res['n_joined']}")
-        except Exception as e:
-            print(f"[AUGMENT] FAILED {participant} {test} {side}: {e}")
-            # leave NaNs; continue
-
-    df.to_csv(csv_path, index=False, float_format="%.3f")
-    print(f"[AUGMENT] Wrote augmented CSV: {csv_path}")
-
-##############################################################################
-# CLI entrypoint
-##############################################################################
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_folder", type=str, required=True,
-                        help="Path to extracted sensorpositioncomparison dataset folder.")
-    parser.add_argument("--participant", type=str, default="4d91")
-    parser.add_argument("--test", type=str, default="normal_10")
-    parser.add_argument("--side", type=str, choices=["left", "right"], default="left")
-    parser.add_argument("--sensor", type=str, default=None,
-                        help="Default: l_instep or r_instep based on side.")
-    parser.add_argument("--toe_marker", type=str, default=None,
-                        help="Default: l_toe or r_toe based on side.")
-    parser.add_argument("--padding_s", type=float, default=3.0)
-    parser.add_argument("--toe_offset_cm", type=float, nargs=3, default=[20.0, 0.0, -9.500000000000008],
-                        help="Virtual toe offset [x y z] in cm in IMU/body frame.")
-    parser.add_argument("--plot", action="store_true")
-    parser.add_argument("--calibrate_toe_z", action="store_true",
-                    help="Grid-search toe z-offset using mocap to minimise MTC bias")
-    parser.add_argument("--plot_worst_k", type=int, default=0,
-                    help="If >0, auto-plot the worst K strides (largest abs error) after validation.")
-
-    # Fast CSV augmentation: compute MTC mean/diff for existing toe_offset_calibration.csv rows (no x/z sweep)
-    parser.add_argument("--augment_calib_csv_with_mtc", action="store_true",
-                        help="Augment an existing toe_offset_calibration.csv by computing MTC mean/diff for each row using its toe_x_cm/toe_z_cm (no calibration sweep).")
-    parser.add_argument("--toe_offset_csv", type=str, default="toe_offset_calibration.csv",
-                        help="Path to toe_offset_calibration.csv to augment (default: toe_offset_calibration.csv).")
-    parser.add_argument(
-        "--summary_only",
-        action="store_true",
-        help="Only print final IMU-only and MTC summary results"
-    )
-    parser.add_argument(
-        "--out_csv",
-        type=str,
-        default="imu_only_all_summary.csv",
-        help="Output CSV filename when --participant all is used (overwritten each run)."
-    )
-    parser.add_argument(
-        "--gate_s",
-        type=float,
-        default=0.15,
-        help="Stride matching tolerance (seconds) used for summary (default 0.15s)."
-    )
-    parser.add_argument(
-        "--calibrate_toe_offset_all",
-        action="store_true",
-        help="Recompute toe (x,z) offset calibration for all participants (overwrites existing entries)."
-    )
-    parser.add_argument(
-        "--calib_test",
-        type=str,
-        default="normal_10",
-        help="Which test to use for toe-offset calibration in --calibrate_toe_offset_all (default: normal_10)."
-    )
-    parser.add_argument("--event_source", type=str, default="heuristic",
-                    choices=["heuristic","ml"],
-                    help="Event detection source: heuristic or ml")
-    parser.add_argument("--event_model_pt", type=str, default=None,
-                        help="Path to TorchScript param.pt for ML event detection")
-    parser.add_argument("--tests", nargs="+", default=None)
-    args = parser.parse_args()
-
-    # -------------------------------
-    # C) Test selection logic
-    # Priority:
-    #   1) --tests slow_10 normal_10 ...
-    #   2) --test all  (or --test None)
-    #   3) --test normal_10
-    # -------------------------------
-    if args.tests is not None and len(args.tests) > 0:
-        tests = list(args.tests)
-    elif args.test is None or str(args.test).lower() == "all":
-        tests = [
-            "slow_10", "slow_20",
-            "normal_10", "normal_20",
-            "fast_10", "fast_20",
-            "long",
-        ]
-    else:
-        tests = [args.test]
-
-
-
-    global CALIB_FILE
-    CALIB_FILE = Path(args.toe_offset_csv)
-
-    global SUMMARY_ONLY
-    SUMMARY_ONLY = getattr(args, "summary_only", False)
-
-    # Silence *all* raw print() calls in the entire script when summary_only is enabled
-    if SUMMARY_ONLY:
-        builtins.print = lambda *a, **k: None
-
-
-    # Defaults
-    if args.sensor is None:
-        args.sensor = "l_instep" if args.side == "left" else "r_instep"
-    if args.toe_marker is None:
-        args.toe_marker = "l_toe" if args.side == "left" else "r_toe"
-
-    # =========================
-    # D1) One-time setup (single participant, multi-test)
-    # =========================
-    eventnet_model = None
-    eventnet_meta = None
-    if str(args.event_source).lower() == "ml":
-        if not args.event_model_pt:
-            raise RuntimeError("--event_source ml requires --event_model_pt <path_to_pt>")
-        force_print(f"[ONE] Loading ML event model: {args.event_model_pt}")
-        eventnet_model, eventnet_meta = load_eventnet(args.event_model_pt, device="cpu")
-
-    # Optional: augment existing toe_offset_calibration.csv with MTC mean/diff columns (no calibration sweep)
-    if getattr(args, "augment_calib_csv_with_mtc", False):
-        augment_existing_toe_offset_csv_with_mtc(
-            csv_path=str(Path(args.toe_offset_csv)),
-            data_folder=args.data_folder,
-            padding_s=args.padding_s,
-        )
-        return
-
-    # ============================================================
-    # Batch toe-offset calibration for ALL participants
-    # ============================================================
-    did_calib_all = False
-
-    if args.calibrate_toe_offset_all:
-
-        did_calib_all = True
-
-        # ---- HARD WIPE: delete old toe offset file so no stale rows remain ----
-        calib_path = Path(args.toe_offset_csv)
-        if calib_path.exists():
-            calib_path.unlink()
-            force_print(f"[CAL-ALL] Wiped existing toe offset file: {calib_path}")
-
-        new_rows = []  
-
-        dataset = SensorPositionComparison2019Mocap(
-            memory=Memory("./cache"),
-            data_folder=args.data_folder,
-            data_padding_s=args.padding_s,
-        )
-
-        seen = set()
-        rows_done = 0
-
-        # Build unique (participant, test) pairs from the dataset index
-        idx = dataset.create_index()  # DataFrame with columns ["participant", "test"]
-
-        rows_done = 0
-        seen = set()
-
-        for _, r in idx.iterrows():
-            p = str(r["participant"])
-            t = str(r["test"])
-            s = "left"  # SPC2019 is left-only
-
-            # ---- only calibrate normal_10 ----
-            if t != args.calib_test:   # or "normal_10" if you hardcode
-                continue
-
-            # Skip incomplete subject 6dbe (README says 6dbe_2 is the complete one)
-            if p == "6dbe":
-                force_print("[CAL-ALL] Skipping 6dbe (incomplete; use 6dbe_2)")
-                continue
-
-            key = (p, t, s)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            try:
-                force_print(f"[CAL-ALL] Calibrating {p} {t} {s}")
-
-                # Get datapoint for this (participant, test)
-                subset = dataset.get_subset(participant=[p], test=[t])
-                if len(subset) == 0:
-                    raise RuntimeError(f"No datapoint for {p} {t}")
-                datapoint = subset[0]
-
-                # Now call your builder/calibration code using p/t/s
-                cal_in = build_calibration_inputs(
-                    data_folder=args.data_folder,
-                    participant=p,
-                    test=t,
-                    side=s,
-                    padding_s=args.padding_s,
-                )
-
-                best = calibrate_toe_offset_xz_instep_two_stage(
-                    p_imu_w=p_imu_w,
-                    qs=qs,
-                    events_imu=events_imu,
-
-                    mocap_traj=mocap_traj,
-                    events_mocap=events_mocap,
-                    toe_marker_name="l_toe",
-
-                    events_gt_imu=events_gt_imu,
-                    fs_hz=fs_hz,
-
-                    ground_mode="min_vel",
-                    half_window=10,
-
-                    # optional tuning
-                    x_min_cm=3.0,
-                    x_max_cm=10.0,
-                    z_min_cm=-4.0,
-                    z_max_cm=-1.0,
-
-                    quiet=False
-                )
-
-                print("\n=== FINAL CALIBRATION RESULT ===")
-                print(f"x_cm  = {best['x_cm']:.2f}")
-                print(f"z_cm  = {best['z_cm']:.2f}")
-                print(f"bias  = {best['bias']*1000:+.2f} mm")
-                print(f"rmse  = {best['rmse']*1000:.2f} mm")
-
-
-                new_rows.append({
-                    "participant": p,
-                    "test": t,          # normal_10
-                    "side": s,          # left
-                    "toe_x_cm": float(best["x_cm"]),
-                    "toe_z_cm": float(best["z_cm"]),
-                    "bias_mm": float(best["bias"]) * 1000.0,
-                    "rmse_mm": float(best["rmse"]) * 1000.0,
-                })
-
-                rows_done += 1
-                force_print(
-                    f"[CAL-ALL] OK {p} {t} | x={best['x_cm']:.1f} cm z={best['z_cm']:.1f} cm | RMSE={best['rmse']*1000:.1f} mm"
-                )
-
-            except Exception as e:
-                force_print(f"[CAL-ALL] FAIL {p} {t}: {e}")
-
-        df_new = pd.DataFrame(new_rows)
-
-        df_new = df_new.sort_values(
-            ["participant", "test", "side"]
-        ).reset_index(drop=True)
-
-        df_new.to_csv(args.toe_offset_csv, index=False)
-
-        force_print(
-            f"[CAL-ALL] Wrote fresh toe offsets to {args.toe_offset_csv} "
-            f"(rows={len(df_new)})"
-        )
-
-        force_print(f"\n[CAL-ALL] Completed toe calibration for {rows_done} rows.")
-
-        # DO NOT return here if user also requested --participant all
-        if str(args.participant).lower() != "all":
-            return
-
-
-
-    # ------------------------
-    # Batch mode: --participant all
-    # Uses ONLY rows in toe_offset_calibration.csv (no calibration sweep)
-    # ------------------------
-    if str(args.participant).lower() == "all":
-        calib_path = Path(args.toe_offset_csv)
-        if not calib_path.exists():
-            raise RuntimeError(f"Calibration CSV not found: {calib_path}")
-
-        df_cal = pd.read_csv(calib_path)
-        required_cols = {"participant", "test", "side", "toe_x_cm", "toe_z_cm"}
-        missing = required_cols - set(df_cal.columns)
-        if missing:
-            raise RuntimeError(f"{calib_path} missing required columns: {sorted(missing)}")
-
-        # Keep only well-formed rows
-        df_cal = df_cal.dropna(subset=["participant", "test", "side", "toe_x_cm", "toe_z_cm"]).copy()
-
-        # De-dup: keep last occurrence for each (participant,test,side)
-        df_cal["side"] = df_cal["side"].astype(str).str.lower()
-        df_cal = df_cal.drop_duplicates(subset=["participant", "test", "side"], keep="last")
-
-        out_rows = []
-
-
-        # ------------------------
-        # load ML model once for batch runs
-        # ------------------------
-        batch_eventnet_model = None
-        batch_eventnet_meta = None
-        if str(args.event_source).lower() == "ml":
-            if not args.event_model_pt:
-                raise RuntimeError("--event_source ml requires --event_model_pt <path_to_pt>")
-            force_print(f"[ALL] Loading ML event model: {args.event_model_pt}")
-            batch_eventnet_model, batch_eventnet_meta = load_eventnet(args.event_model_pt, device="cpu")
-            # Optional sanity check: warn if model was trained at a different fs
-            try:
-                mfs = batch_eventnet_meta.get("fs_hz", None)
-                if mfs and abs(float(mfs) - float(200.0)) > 1e-6 and abs(float(mfs) - float(args.fs_hz)) > 1e-6:
-                    force_print(f"[ALL][WARN] Model fs_hz={mfs} differs from run fs_hz={args.fs_hz}.")
-            except Exception:
-                pass
-
-        for _, r in df_cal.iterrows():
-            p = str(r["participant"])
-            t = str(r["test"])
-            s = str(r["side"]).lower()
-            x = float(r["toe_x_cm"])
-            z = float(r["toe_z_cm"])
-
-            try:
-                row = run_pipeline_for_row_report(
-                    data_folder=args.data_folder,
-                    participant=p,
-                    test=t,
-                    side=s,
-                    toe_x_cm=x,
-                    toe_z_cm=z,
-                    padding_s=args.padding_s,
-                    event_source=args.event_source,
-                    eventnet_model=batch_eventnet_model,
-                    eventnet_meta=batch_eventnet_meta,
-                    quiet=True,
-                    print_reject_counts=True,
-                    gate_s=float(args.gate_s),   # still used if dynamic_gate=False
-                    dynamic_gate=True,
-                    dynamic_zupt=True,
-                    dynamic_ic_refine=True,
-                    dynamic_cutoff=True,
-                )
-                out_rows.append(row)
-                force_print(f"[ALL] OK  {p} {t} {s} | MTC RMSE={row['mtc_rmse_mm']:.2f} mm | N={row['mtc_n']}")
-            except Exception as e:
-                # still write a row so the spreadsheet shows failures explicitly
-                out_rows.append({
-                    "participant": p, "test": t, "side": s,
-                    "toe_x_cm": x, "toe_z_cm": z,
-                    "error": str(e),
-                })
-                force_print(f"[ALL] FAIL {p} {t} {s} | {e}")
-
-        df_out = pd.DataFrame(out_rows)
-        df_out.to_csv(args.out_csv, index=False)
-        force_print(f"\n[ALL] Wrote spreadsheet: {args.out_csv}")
-        return
-
-    # =========================
-    # D2) Run ONE participant across ALL selected tests
-    # =========================
-    if str(args.participant).lower() != "all":
-        out_rows = []
-
-        # If you have a toe_offset_csv with per-test offsets, use it; otherwise use --toe_offset_cm
-        # (Your runner expects toe_x_cm/toe_z_cm)
-        # Force one toe offset for all tests: use normal_10 as the reference
-        ref_test = "normal_10"
-        ref = load_toe_offset(str(args.participant), ref_test, str(args.side).lower())
-
-        if ref is None:
-            raise RuntimeError(f"No toe offset found for {args.participant} {ref_test} {args.side} in {CALIB_FILE}")
-
-        toe_x_ref_cm = float(ref["x_cm"])
-        toe_z_ref_cm = float(ref["z_cm"])
-
-        force_print(f"[TOE] Using {ref_test} toe offset for ALL tests: x={toe_x_ref_cm:.2f} cm, z={toe_z_ref_cm:.2f} cm")
-
-        for t in tests:
-            
-            toe_x_cm = toe_x_ref_cm
-            toe_z_cm = toe_z_ref_cm
-
-            try:
-                row = run_pipeline_for_row_report(
-                    data_folder=args.data_folder,
-                    participant=str(args.participant),
-                    test=str(t),
-                    side=str(args.side).lower(),
-                    toe_x_cm=toe_x_cm,
-                    toe_z_cm=toe_z_cm,
-                    padding_s=float(args.padding_s),
-                    event_source=str(args.event_source).lower(),
-                    eventnet_model=eventnet_model,
-                    eventnet_meta=eventnet_meta,
-                    quiet=bool(args.summary_only),
-                    print_reject_counts=True,
-                    gate_s=float(args.gate_s),
-                    dynamic_gate=True,
-                    dynamic_zupt=True,
-                    dynamic_ic_refine=True,
-                    dynamic_cutoff=True,
-                )
-                out_rows.append(row)
-                force_print(f"[ONE] OK  {args.participant} {t} {args.side} | MTC RMSE={row['mtc_rmse_mm']:.2f} mm | N={row['mtc_n']}")
-            except Exception as e:
-                out_rows.append({
-                    "participant": str(args.participant),
-                    "test": str(t),
-                    "side": str(args.side).lower(),
-                    "toe_x_cm": toe_x_cm,
-                    "toe_z_cm": toe_z_cm,
-                    "error": str(e),
-                })
-                force_print(f"[ONE] FAIL {args.participant} {t} {args.side} | {e}")
-
-        df_out = pd.DataFrame(out_rows)
-
-        # write a single-participant summary file (separate from --participant all)
-        one_out = Path(args.out_csv).with_name(f"one_{args.participant}_alltests_summary.csv")
-        df_out.to_csv(one_out, index=False)
-        force_print(f"\n[ONE] Wrote spreadsheet: {one_out}")
-        return
-
-
-    # Load dataset (MoCap version)
-    dataset = SensorPositionComparison2019Mocap(
-        memory=Memory("./cache"),
-        data_folder=args.data_folder,
-        data_padding_s=args.padding_s
-    )
-
-    subset = dataset.get_subset(participant=[args.participant], test=[args.test])
-    if len(subset) == 0:
-        raise RuntimeError(f"No datapoint found for participant={args.participant}, test={args.test}")
-    datapoint = subset[0]
-
-    imu_all = datapoint.data
-    fs_hz = float(datapoint.sampling_rate_hz)
-    mocap_traj = datapoint.marker_position_
-
-    if args.sensor not in imu_all.columns.get_level_values(0):
-        raise RuntimeError(f"Sensor '{args.sensor}' not found. Available: {sorted(set(imu_all.columns.get_level_values(0)))}")
-    if args.toe_marker not in mocap_traj.columns.get_level_values(0):
-        raise RuntimeError(f"Toe marker '{args.toe_marker}' not found. Available: {sorted(set(mocap_traj.columns.get_level_values(0)))}")
-
-    imu_df = imu_all[args.sensor][["acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z"]].copy()
-    events_mocap = datapoint.mocap_events_[args.side]
-    events_gt_imu = datapoint.convert_events_with_padding(events_mocap, from_time_axis="mocap", to_time_axis="imu")
-    
-    events_mocap = events_mocap.reset_index(drop=True).copy()
-    events_gt_imu = events_gt_imu.reset_index(drop=True).copy()
-
-    events_imu = None  # IMU-only detected events will be created after Phase 1.3
-    #debug_print_events(events_imu)
-    #print("IMU length:", len(imu_df))
-
-    # ------------------------
-    # Phase 1.1
-    # ------------------------
-    phase_cfg = phase_1_1_define_mtc_objective()
-    print_phase("Phase 1.1", f"Objective: {phase_cfg}")
-
-
-    # ------------------------
-    # Phase 1.2
-    # ------------------------
-    p_toe_b = phase_1_2_define_virtual_toe_point(args.toe_offset_cm)
-    print_phase("Phase 1.2", f"Toe offset (m): {p_toe_b.tolist()}")
-
-    # ------------------------
-    # Phase 1.3
-    # ------------------------
-    imu_f = phase_1_3_filter_imu(imu_df, fs_hz, dynamic=True)
-    acc_norm = np.median(np.linalg.norm(imu_f[['acc_x','acc_y','acc_z']].to_numpy(), axis=1))
-    print_phase("Phase 1.3", f"Filtered acc_norm median(all)={acc_norm:.3f} m/s^2")
-
-    # ------------------------
-    # IMU-only event detection (IC/TC) for Phase 1.4+
-    # ------------------------
-    if args.event_source == "ml":
-        if not args.event_model_pt:   
-            raise RuntimeError("--event_source ml requires --event_model_pt <path_to_param.pt>")
-
-        model, meta = load_eventnet(args.event_model_pt, device="cpu")  # CPU ok
-        events_imu, det_dbg = phase_1_4_detect_events_ml(
-            imu_f, fs_hz, model, meta,
-            # you can tune these thresholds per model:
-            p_enter=0.55, p_exit=0.45,
-            min_stance_s=0.10, min_swing_s=0.10,
-            gap_fill_s=0.03, refractory_s=0.30,
-        )
-    else:
-        events_imu, det_dbg = phase_1_4_detect_events_imu_only(
-            imu_f,
-            fs_hz,
-            gyro_th_deg_s=12.0,
-            acc_th_m_s2=2.0,
-            min_stance_s=0.12,
-            min_swing_s=0.14,
-            gap_fill_s=0.02,
-            refractory_s=0.45
-        )
-
-
-    if (det_dbg is not None) and ("reject_counts" in det_dbg):
-        force_print("[Phase 1.4] reject_counts:", det_dbg["reject_counts"])
-
-
-        
-    if events_imu is None or len(events_imu) == 0:
-        raise RuntimeError(
-            "IMU-only event detection produced no strides. "
-            "Adjust gyro_th_deg_s / acc_th_m_s2 / min_stance_s / min_swing_s."
-        )
-    print_phase("Phase 1.4a", f"IMU-only detected strides: {len(events_imu)} | stance_segments={det_dbg.get('n_stance_segments', 'NA')}")
-
-    # ---- NEW: post-filter invalid / duplicate strides (reduces over-detection) ----
-    n_before = len(events_imu)
-    events_imu = phase_1_4b_filter_invalid_strides(events_imu, fs_hz)
-    n_after = len(events_imu)
-    
-    print_phase("Phase 1.4b", f"Stride validity filter: kept {n_after}/{n_before} ({100.0*n_after/max(1,n_before):.1f}%)")
-    if events_imu is None or len(events_imu) == 0:
-        raise RuntimeError(
-            "Phase 1.4b removed all detected strides. "
-            "Your stride validity gates are too strict for this trial. "
-            "Relax timing thresholds or reduce refractory."
-        )
-
-    # ------------------------
-    # Phase 1.4
-    # ------------------------
-    zupt_mask = phase_1_4_get_zupt_mask_from_min_vel(
-        events_imu,
-        n_samples=len(imu_f),
-        dynamic=True,
-        fs_hz=fs_hz,
-        frac=0.03,
-        min_hw=6,
-        max_hw=25,
-        stride_ref="ic2ic",
-    )
-
-    force_print("[ZUPT] dynamic window enabled (frac=0.03, clamp=6..25 samples)")
-
-    # debug_units_and_magnitude(imu_f, zupt_mask)
-    debug_gyro_units(imu_f, zupt_mask)
-    zupt_pct = 100.0 * float(np.mean(zupt_mask))
-    n_stride_rows = len(events_imu.dropna(subset=["min_vel"]))
-    print_phase("Phase 1.4", f"ZUPT samples (min_vel±10): {zupt_pct:.1f}% | strides_with_min_vel={n_stride_rows}")
-
-    # ------------------------
-    # Phase 1.5
-    # ------------------------
-    qs = phase_1_5_estimate_orientation(imu_f, fs_hz)
-    print_phase("Phase 1.5", f"Quaternion array shape: {qs.shape} (w,x,y,z)")
-
-    acc_w = phase_1_5_compute_world_acceleration(imu_f, qs)
-    specific_acc_w, g_mode = phase_1_5_remove_gravity(acc_w, zupt_mask)
-
-    print_phase("Phase 1.5", f"Gravity mode: {g_mode}")
-    print_phase("Phase 1.5", f"acc_w stance median z: {np.median(acc_w[zupt_mask,2]):.3f} m/s^2 | "
-                            f"|acc_w| stance median: {np.median(np.linalg.norm(acc_w[zupt_mask],axis=1)):.3f}")
-
-
-    # --- IC refinement using specific acceleration (IMU-only) ---
-    events_imu = refine_ic_with_specific_acc(
-        events_imu,
-        specific_acc_w=specific_acc_w,
-        fs_hz=fs_hz,
-        dynamic=True,
-        pre_frac=0.12,
-        post_frac=0.03,
-        stride_ref="ic2ic",
-    )
-
-    force_print(f"[IC] refine dynamic enabled: pre_frac=0.12 post_frac=0.03")
-
-    if args.plot:
-        plot_imu_mocap_events_window(
-            imu_f=imu_f,
-            mocap_traj=mocap_traj,
-            events_imu=events_imu,
-            toe_marker_name=args.toe_marker,
-            fs_hz=fs_hz,
-            stride_idx=9,     # change this to inspect other strides
-            n_strides=4,
-        )
-        return
-
-    half_window_samples = 10
-    if dynamic_zupt:
-        ref = events_gt_imu if (events_gt_imu is not None and len(events_gt_imu) > 3) else events_imu
-        stride = ref.dropna(subset=["ic"]).sort_values("ic")
-        ic = stride["ic"].to_numpy(dtype=int)
-
-        if len(ic) >= 3:
-            stride_s = float(np.median(np.diff(ic) / float(fs_hz)))
-            hw_s = 0.03 * stride_s  # 3% stride duration
-            half_window_samples = int(np.clip(round(hw_s * fs_hz), 6, 25))
-
-    # ------------------------
-    # Phase 1.6
-    # ------------------------
-    pz, vz = phase_1_6_integrate_z_only_per_stride_anchor_min_vel(
-        specific_acc_w,
-        events_imu,
-        fs_hz,
-        half_window=half_window_samples,
-        enforce_end_vel_zero=True,
-        shift_to_tc=True,
-    )
-
-    print("pz swing min/max (mm):", np.min(pz)*1000, np.max(pz)*1000)
-    print("vz swing min/max (m/s):", np.min(vz), np.max(vz))
-
-    p_imu_w = np.zeros((len(pz), 3), dtype=float)
-    v_imu_w = np.zeros((len(vz), 3), dtype=float)
-    p_imu_w[:, 2] = pz
-    v_imu_w[:, 2] = vz
-
-    pz_min, pz_max = float(np.min(pz)), float(np.max(pz))
-    
-    print_phase("Phase 1.6", f"v_imu_w norm median (stance) = {np.median(np.linalg.norm(v_imu_w[zupt_mask],axis=1)):.4f} m/s "
-                         f"(should be near 0)")
-
-    print_phase("Phase 1.6",
-        f"p_imu_w z-range: {pz_min:.3f} .. {pz_max:.3f} m "
-        f"(note: absolute z can drift; compare per-stride clearance, not global range)"
-    )
-
-    print_phase("Phase 1.6", f"specific_acc_w z median (ZUPT) = {np.median(specific_acc_w[zupt_mask,2]):.4f} m/s^2 "
-                         f"(should be near 0)")
-    print("[Phase 1.6] v_norm median(all):", float(np.median(np.linalg.norm(v_imu_w, axis=1))))
-    print("[Phase 1.6] p_z range:", float(np.min(p_imu_w[:,2])), "..", float(np.max(p_imu_w[:,2])))
-    print("[Phase 1.6] per-axis v median:", np.median(v_imu_w, axis=0))
-    print("[Phase 1.6] sanity: mean v over all =", np.mean(v_imu_w, axis=0))
-    print("[Phase 1.6] v @ ZUPT median:", np.median(v_imu_w[zupt_mask], axis=0))
-    print("[Phase 1.6] v @ ZUPT norm median:", np.median(np.linalg.norm(v_imu_w[zupt_mask], axis=1)))
-    
-    pz_detrended = pz - np.median(pz[zupt_mask])
-    print("[Phase 1.6] pz detrended range:", float(np.min(pz_detrended)), "..", float(np.max(pz_detrended)))
-
-    bad = 0
-    for _, r in events_imu.dropna(subset=["start","end","min_vel"]).iterrows():
-        s,e,mv = int(r["start"]), int(r["end"]), int(r["min_vel"])
-        if not (0 <= s < mv < e <= len(imu_f)):
-            bad += 1
-    
-    valid_ev = events_imu.dropna(subset=["start","end","min_vel"])
-    print("[Phase 1.6] bad event rows:", bad, "/", len(valid_ev))
-
-    # ===== Phase 0: Toe (X,Z) offset calibration or load =====
-    if args.calibrate_toe_z:
-        print("\n=== Phase 0: Toe (X,Z) offset calibration ===")
-
-        cached = load_toe_offset(
-            participant=args.participant,
-            test=args.test,
-            side=args.side
-        )
-
-        if cached is not None:
-            print(
-                f"[Calibration] Loaded cached toe offset for "
-                f"{args.participant} | {args.test} | {args.side}"
-            )
-            print(
-                f"[Calibration] toe (x,z)=({cached['x_cm']:.2f} cm, {cached['z_cm']:.2f} cm) "
-                f"| RMSE={cached['rmse_mm']:.1f} mm"
-            )
-
-            p_toe_b = np.array(
-                [cached["x_cm"] / 100.0, 0.0, cached["z_cm"] / 100.0],
-                dtype=float
-            )
-
-        else:
-            print("[Calibration] No cached calibration found — running grid search")
-
-            best = calibrate_toe_offset_xz_instep_two_stage(
-                p_imu_w=p_imu_w,
-                qs=qs,
-                events_imu=events_imu,
-
-                mocap_traj=mocap_traj,
-                events_mocap=events_mocap,
-                toe_marker_name="l_toe",
-
-                events_gt_imu=events_gt_imu,
-                fs_hz=fs_hz,
-
-                ground_mode="min_vel",
-                half_window=10,
-
-                # optional tuning
-                x_min_cm=3.0,
-                x_max_cm=10.0,
-                z_min_cm=-4.0,
-                z_max_cm=-1.0,
-
-                quiet=True
-            )
-
-            print("\n=== FINAL CALIBRATION RESULT ===")
-            print(f"x_cm  = {best['x_cm']:.2f}")
-            print(f"z_cm  = {best['z_cm']:.2f}")
-            print(f"bias  = {best['bias']*1000:+.2f} mm")
-            print(f"rmse  = {best['rmse']*1000:.2f} mm")
-
-
-            save_toe_offset(
-                participant=args.participant,
-                test=args.test,
-                side=args.side,
-                best=best
-            )
-
-            p_toe_b = np.array(
-                [best["x_cm"] / 100.0, 0.0, best["z_cm"] / 100.0],
-                dtype=float
-            )
-        
-    # ------------------------
-    # Phase 1.8 (includes 1.7 internally per stride)
-    # ------------------------
-    imu_stride_res, debug = phase_1_8_compute_mtc_per_stride(
-        p_imu_w, qs, p_toe_b, events_imu,
-        ground_mode="min_vel", half_window=10
-    )
-
-    print("imu_stride_res.columns:", list(imu_stride_res.columns))
-    print("imu_stride_res.head():\n", imu_stride_res.head())
-
-
-    # ---- Phase 1.8 prints (robust) ----
-    n_total = len(events_imu.dropna(subset=["ic","tc","start","end"]))
-
-    # Step B: show why strides are being rejected
-    rej = (debug or {}).get("rej_counts", {}) or {}
-    if rej:
-        top = sorted(rej.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        print("[Phase 1.8] top rejects:", ", ".join([f"{k}={v}" for k, v in top]))
-    else:
-        print("[Phase 1.8] top rejects: none")
-
-
-    if imu_stride_res is None or imu_stride_res.empty:
-        print_phase("Phase 1.8", f"No valid strides after filtering. kept=0 out of {n_total}")
-        print("[Phase 1.8] MTC IMU: n/a (no valid strides)")
-    else:
-        g = imu_stride_res["ground_z"].to_numpy(dtype=float)
-        gstd = imu_stride_res["ground_std_m"].to_numpy(dtype=float)
-
-        g_med_mm = float(np.median(g) * 1000.0)
-        g_iqr_mm = float((np.percentile(g, 75) - np.percentile(g, 25)) * 1000.0)
-
-        kept = len(imu_stride_res)
-        print_phase("Phase 1.8",
-            f"Ground reference height (relative): median={g_med_mm:.1f} mm | IQR={g_iqr_mm:.1f} mm"
-        )
-        print(f"[Phase 1.8] ground_std threshold: 5.000 mm (reject if above)")
-
-        print(f"[Phase 1.8] kept strides: {kept} out of {n_total} ({100.0*kept/max(n_total,1):.1f}%)")
-        print(f"[Phase 1.8] ground_std_m median: {float(np.median(gstd)*1000.0):.3f} mm")
-        print(f"[Phase 1.8] ground_std_m 95%:   {float(np.percentile(gstd,95)*1000.0):.3f} mm")
-
-        mtc = imu_stride_res["mtc_imu_m"].to_numpy(dtype=float) * 1000.0
-        print(f"[Phase 1.8] MTC IMU median: {np.median(mtc):.1f} mm | "
-            f"5–95%: {np.percentile(mtc,5):.1f}..{np.percentile(mtc,95):.1f} mm")
-
-        debug["zupt_mask"] = zupt_mask
-        debug["phase_cfg"] = phase_cfg
-
-    
-    # ------------------------
-    # IMU-only -> MoCap stride matching (MoCap used ONLY for scoring)
-    # ------------------------
-    gate_s = 0.15  # stride matching tolerance in seconds
-    mapping_df, match_sum = match_strides_by_mid_swing_dp(
-        events_imu,
-        events_gt_imu,
-        fs_hz,
-        gate_s=gate_s
-    )
-    
-    fp = match_sum["n_det"] - match_sum["n_matched"]
-    fn = match_sum["n_gt"] - match_sum["n_matched"]
-    
-    print_phase(
-        "IMU-only Events",
-        f"FP={fp} (extra detections) | FN={fn} (missed GT strides) | gate_s={gate_s:.2f}s",
-        always=True
-    )
-
-    imu_stride_res_scored = apply_stride_mapping_to_imu_results(imu_stride_res, events_imu, mapping_df, events_gt_imu)
-
-    # Timing-error summary (samples -> ms) on matched set
-    if (imu_stride_res_scored is not None) and (not imu_stride_res_scored.empty):
-        tc_err_ms = (imu_stride_res_scored["tc_err_samples"].to_numpy(dtype=float) / fs_hz) * 1000.0
-        ic_err_ms = (imu_stride_res_scored["ic_err_samples"].to_numpy(dtype=float) / fs_hz) * 1000.0
-        print_phase(
-            "IMU-only Events",
-            f"Stride match: matched={match_sum['n_matched']} | det={match_sum['n_det']} | gt={match_sum['n_gt']} | "
-            f"precision={match_sum['stride_precision']*100:.1f}% | recall={match_sum['stride_recall']*100:.1f}%\n"
-            f"TC timing: bias={np.mean(tc_err_ms):+.1f} ms | RMSE={np.sqrt(np.mean(tc_err_ms**2)):.1f} ms\n"
-            f"IC timing: bias={np.mean(ic_err_ms):+.1f} ms | RMSE={np.sqrt(np.mean(ic_err_ms**2)):.1f} ms",
-            always=True
-        )
-    else:
-        print_phase("IMU-only Events",
-            f"Stride match: matched={match_sum['n_matched']} | det={match_sum['n_det']} | gt={match_sum['n_gt']} | "
-            f"precision={match_sum['stride_precision']*100:.1f}% | recall={match_sum['stride_recall']*100:.1f}%\n"
-            f"(No matched strides available for timing summary.)",
-            always=True
-        )
-    
-    # If nothing matched, we cannot score MTC vs MoCap by stride id
-    if mapping_df is None or mapping_df.empty:
-        force_print("[IMU-only Events] No matched strides -> skipping Phase 1.9 comparison.")
-        return
-
-
-    # ------------------------
-    # Phase 1.9
-    # ------------------------
-    joined, bias, rmse, extra = phase_1_9_validate_against_mocap(
-        mocap_traj=mocap_traj,
-        events_mocap=events_mocap,
-        toe_marker_name=args.toe_marker,
-        imu_stride_res=imu_stride_res_scored,
-        plot=args.plot,
-        fs_hz=fs_hz,
-        debug=debug,
-        verbose=False,
-        events_imu=None,
-        plot_worst_k=args.plot_worst_k
-    )
-
-
-    # Requested: average MTC difference between IMU and MoCap
-    mtc_imu_mean_mm = mm(extra.get("mtc_imu_mean_m", np.nan)) if extra is not None else float("nan")
-    mtc_mocap_mean_mm = mm(extra.get("mtc_mocap_mean_m", np.nan)) if extra is not None else float("nan")
-    mtc_avg_diff_mm = mm(extra.get("mtc_avg_diff_m", bias)) if extra is not None else mm(bias)
-    mtc_mean_abs_diff_mm = mm(extra.get("mtc_mean_abs_diff_m", np.nan)) if extra is not None else float("nan")
-
-    print_phase(
-        "Phase 1.9",
-        f"Bias={mm(bias):.1f} mm | RMSE={mm(rmse):.1f} mm | N={len(joined)}\n"
-        f"MTC mean: IMU={mtc_imu_mean_mm:.1f} mm | MoCap={mtc_mocap_mean_mm:.1f} mm | "
-        f"Avg diff (IMU−MoCap)={mtc_avg_diff_mm:.1f} mm | Mean |diff|={mtc_mean_abs_diff_mm:.1f} mm",
-    )
-    print("[Phase 1.9] Note: Bias = (IMU - MoCap). Positive means IMU overestimates clearance.")
-
-    print("[Phase 1.9] events_mocap columns:", events_mocap.columns)
-
-    # Quick summary
-    print_phase(
-        "Run Summary",
-        f"Participant: {args.participant} | Test: {args.test} | Side: {args.side}\n"
-        f"IMU sensor: {args.sensor} | Toe marker: {args.toe_marker}\n"
-        f"Toe offset (m): {p_toe_b.tolist()}\n"
-        f"Phase objective: {phase_cfg}",
-        always=True
-    )
-
-    def _fmt_metrics(name, bias_m, rmse_m, joined_df, extra_dict):
-        # all in mm for reporting
-        N = int(len(joined_df)) if joined_df is not None else 0
-        mtc_imu_mean_mm = mm(extra_dict.get("mtc_imu_mean_m", np.nan)) if extra_dict else float("nan")
-        mtc_mocap_mean_mm = mm(extra_dict.get("mtc_mocap_mean_m", np.nan)) if extra_dict else float("nan")
-        mtc_avg_diff_mm = mm(extra_dict.get("mtc_avg_diff_m", bias_m)) if extra_dict else mm(bias_m)
-        mtc_mean_abs_diff_mm = mm(extra_dict.get("mtc_mean_abs_diff_m", np.nan)) if extra_dict else float("nan")
-
-        return {
-            "Mode": name,
-            "Bias (mm)": mm(bias_m),
-            "RMSE (mm)": mm(rmse_m),
-            "N": N,
-            "MTC mean IMU (mm)": mtc_imu_mean_mm,
-            "MTC mean MoCap (mm)": mtc_mocap_mean_mm,
-            "Avg diff IMU−MoCap (mm)": mtc_avg_diff_mm,
-            "Mean |diff| (mm)": mtc_mean_abs_diff_mm,
-        }
-
-    # ----------------------------
-    # (A) IMU-only timing (already computed): joined, bias, rmse, extra
-    # ----------------------------
-    row_imu_only = _fmt_metrics("IMU-only timing", bias, rmse, joined, extra)
-
-    # ----------------------------
-    # Print comparison table
-    # ----------------------------
-    df_cmp = pd.DataFrame([row_imu_only])
-
-    # nice formatting
-    cols = ["Mode", "Bias (mm)", "RMSE (mm)", "N",
-            "MTC mean IMU (mm)", "MTC mean MoCap (mm)",
-            "Avg diff IMU−MoCap (mm)", "Mean |diff| (mm)"]
-
-    force_print("\n=== MTC Summary Comparison ===")
-    force_print(df_cmp.to_string(index=False))
-    force_print("Done.")
-
-
-if __name__ == "__main__":
-    main()
