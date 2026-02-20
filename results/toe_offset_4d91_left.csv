@@ -1,0 +1,2 @@
+participant,test,side,imu_sensor,toe_marker,toe_x_cm,toe_y_cm,toe_z_cm,bias_mm,rmse_mm,n
+4d91,"slow_10,normal_10,fast_10,slow_20,normal_20,fast_20,long",left,l_instep,l_toe,2.700000000000001,6.25,0.0,-1.552239843456239,8.611502143891379,374

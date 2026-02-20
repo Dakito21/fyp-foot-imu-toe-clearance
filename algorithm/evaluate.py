@@ -36,6 +36,13 @@ def main() -> None:
     ap.add_argument('--event_model_pt', default=None)
     ap.add_argument('--no_dynamic_zupt', action='store_true')
     ap.add_argument('--no_dynamic_gate', action='store_true')
+    ap.add_argument('--debug_grid', action='store_true',
+                    help='Plot same stride across all tests in a grid')
+    ap.add_argument('--debug_stride_id', type=int, default=None,
+                    help='Stride ID to visualize across tests')
+    ap.add_argument('--debug_grid_cols', type=int, default=3,
+                    help='Number of columns in debug grid')
+
 
     args = ap.parse_args()
 
@@ -66,7 +73,7 @@ def main() -> None:
 
         df = pd.DataFrame(rows)
 
-    required = {'participant', 'test', 'side', 'toe_x_cm', 'toe_z_cm'}
+    required = {'participant', 'test', 'side', 'toe_x_cm', 'toe_y_cm', 'toe_z_cm'}
     missing = required - set(df.columns)
     if missing:
         raise SystemExit(f'toe_offset_csv missing columns: {sorted(missing)}')
@@ -83,7 +90,7 @@ def main() -> None:
 
     # map (participant, side) -> (toe_x_cm, toe_z_cm) from normal_10
     normal_toe_map = {
-        (str(r["participant"]), str(r["side"]).lower()): (float(r["toe_x_cm"]), float(r["toe_z_cm"]))
+        (str(r["participant"]), str(r["side"]).lower()): (float(r["toe_x_cm"]), float(r["toe_y_cm"]), float(r["toe_z_cm"]))
         for _, r in normal_df.iterrows()
     }
     # Pipeline is run in fully-dynamic mode
@@ -96,7 +103,7 @@ def main() -> None:
             raise SystemExit('--event_source ml requires --event_model_pt')
         eventnet_model, eventnet_meta = core.legacy.load_eventnet(args.event_model_pt, device="cpu")
 
-
+    debug_by_test = {}
     rows = []
     for _, r in df.iterrows():
         p = str(r['participant'])
@@ -105,7 +112,7 @@ def main() -> None:
         # Always use normal_10 offsets for this participant+side
         if (p, s) not in normal_toe_map:
             raise KeyError(f"No normal_10 toe offset found for participant={p} side={s}")
-        toe_x_cm, toe_z_cm = normal_toe_map[(p, s)]
+        toe_x_cm, toe_y_cm, toe_z_cm = normal_toe_map[(p, s)]
 
 
         sensor = r['imu_sensor'] if 'imu_sensor' in df.columns and pd.notna(r.get('imu_sensor')) else None
@@ -123,13 +130,14 @@ def main() -> None:
             )
 
             # evaluation uses the legacy row reporter for now (already produces your desired flat row)
-            row = core.legacy.run_pipeline_for_row_report(
+            ret = core.legacy.run_pipeline_for_row_report(
                 data_folder=args.data_folder,
                 participant=p,
                 test=t,
                 side=s,
                 toe_x_cm=toe_x_cm,
                 toe_z_cm=toe_z_cm,
+                toe_y_cm=toe_y_cm,
                 sensor=trial.sensor,
                 toe_marker=trial.toe_marker,
                 padding_s=args.padding_s,
@@ -143,7 +151,16 @@ def main() -> None:
                 dynamic_zupt=toggles.dynamic_zupt,
                 dynamic_ic_refine=toggles.dynamic_ic_refine,
                 dynamic_cutoff=toggles.dynamic_cutoff,
+                return_debug=bool(args.debug_grid and args.debug_stride_id is not None),
+                debug_plot=False,  # IMPORTANT: prevent per-test popups
             )
+            if isinstance(ret, tuple):
+                row, debug = ret
+                if args.debug_grid and args.debug_stride_id is not None:
+                    debug_by_test[t] = debug
+            else:
+                row = ret
+
             row['event_source'] = args.event_source
             rows.append(row)
 
@@ -153,12 +170,23 @@ def main() -> None:
                 'test': t,
                 'side': s,
                 'toe_x_cm': toe_x_cm,
+                'toe_y_cm': toe_y_cm,
                 'toe_z_cm': toe_z_cm,
                 'error': str(e),
                 'event_source': args.event_source,
             })
 
     out_df = pd.DataFrame(rows)
+    # ---- Grid debug plot across all tests ----
+    if args.debug_grid and args.debug_stride_id is not None and debug_by_test:
+        print(f"\n[DEBUG GRID] Plotting stride {args.debug_stride_id} across {len(debug_by_test)} tests")
+        core.legacy.plot_stride_grid_clearance(
+            int(args.debug_stride_id),
+            debug_by_test,
+            ncols=int(args.debug_grid_cols),
+            suptitle=f"{p} {s} | stride {args.debug_stride_id}"
+        )
+
     out_path = Path(args.out_csv)
     out_df.to_csv(out_path, index=False)
     print(f'[EVAL] Saved: {out_path.resolve()}')
