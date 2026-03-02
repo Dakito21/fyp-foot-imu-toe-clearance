@@ -30,17 +30,6 @@ import numpy as np
 import pandas as pd
 import os
 import json
-import contextlib, os, sys
-
-@contextlib.contextmanager
-def suppress_stdout():
-    save = sys.stdout
-    try:
-        with open(os.devnull, "w") as f:
-            sys.stdout = f
-            yield
-    finally:
-        sys.stdout = save
 
 # Legacy implementation (your existing, messy script)
 import mtc_pipeline as legacy
@@ -99,23 +88,30 @@ class PipelineToggles:
 
 @dataclass(frozen=True)
 class CalibrationSearch:
-
     # Hard clamps (match the box)
-    x_min_cm: float = 8.0
-    x_max_cm: float = 22.0
-    z_min_cm: float = -4.0
-    z_max_cm: float = 4.0
+    x_min_cm: float = 0.0
+    x_max_cm: float = 8.0
 
+    y_min_cm: float = 0.0
+    y_max_cm: float = 10.0   # <-- add (based on your sweep)
 
-    # Coarse grid (x only style range)
-    x_coarse_cm: Tuple[float, float, float] = (x_min_cm, x_max_cm, 0.5)   # start, stop, step
-    z_coarse_cm: Tuple[float, float, float] = (z_min_cm, z_max_cm, 0.5)     # force z=0 in coarse
+    z_min_cm: float = 0
+    z_max_cm: float = 0
+
+    # Coarse grid
+    x_coarse_cm: Tuple[float, float, float] = (x_min_cm, x_max_cm, 0.5)
+    y_coarse_cm: Tuple[float, float, float] = (y_min_cm, y_max_cm, 1.0)   # <-- add
+    z_coarse_cm: Tuple[float, float, float] = (z_min_cm, z_max_cm, 1)
 
     # Fine window around best coarse
-    x_fine_halfwidth_cm: float = 1.5
-    z_fine_halfwidth_cm: float = 0.8
+    x_fine_halfwidth_cm: float = 0.8
+    y_fine_halfwidth_cm: float = 1.5   # <-- add
+    z_fine_halfwidth_cm: float = 0.0
+
     x_fine_step_cm: float = 0.1
-    z_fine_step_cm: float = 0.1  # unused if z_halfwidth=0
+    y_fine_step_cm: float = 0.25       # <-- add
+    z_fine_step_cm: float = 0.05
+
 
 # -----------------------------
 # Loading
@@ -209,6 +205,8 @@ def precompute(
 ) -> Precomputed:
     """Run the pipeline up to Phase 1.6, and also compute stride mapping once."""
 
+    STRIDE_CLOCK = "tc2tc"   # or "ic2ic"
+
     fs_hz = float(trial.fs_hz)
 
     # Phase 1.3 filter
@@ -241,19 +239,27 @@ def precompute(
         frac=0.03,
         min_hw=6,
         max_hw=25,
-        stride_ref="ic2ic",
+        stride_ref=STRIDE_CLOCK,
     )
 
-    # half-window heuristic (same as your current behavior)
+    # half-window heuristic (keep consistent with STRIDE_CLOCK)
     half_window_samples = 10
     if toggles.dynamic_zupt:
         ref = trial.events_gt_imu if (trial.events_gt_imu is not None and len(trial.events_gt_imu) > 3) else events_imu
-        stride = ref.dropna(subset=["ic", "tc"]).sort_values("ic")
-        ic = stride["ic"].to_numpy(dtype=int)
-        if len(ic) >= 3:
-            stride_s = float(np.median(np.diff(ic) / fs_hz))
+        stride = ref.dropna(subset=["ic", "tc"]).copy()
+
+        if STRIDE_CLOCK == "tc2tc":
+            stride = stride.sort_values("tc")
+            idx = stride["tc"].to_numpy(dtype=int)
+        else:
+            stride = stride.sort_values("ic")
+            idx = stride["ic"].to_numpy(dtype=int)
+
+        if len(idx) >= 3:
+            stride_s = float(np.median(np.diff(idx) / fs_hz))
             hw_s = 0.03 * stride_s
             half_window_samples = int(np.clip(round(hw_s * fs_hz), 6, 25))
+
 
     # Phase 1.5 orientation
     qs = legacy.phase_1_5_estimate_orientation(imu_f, fs_hz, zupt_mask=zupt_mask)
@@ -279,8 +285,47 @@ def precompute(
             dynamic=True,
             pre_frac=0.12,
             post_frac=0.03,
-            stride_ref="ic2ic",
+            stride_ref=STRIDE_CLOCK,
         )
+
+    def enforce_tc2tc_stride_boundaries(events_imu: pd.DataFrame) -> pd.DataFrame:
+        """
+        Force stride boundaries to be tc[k] -> tc[k+1].
+        Overwrites start/end safely.
+        """
+        ev = events_imu.copy().sort_values("tc").reset_index(drop=True)
+
+        tc_idx = ev["tc"].to_numpy(dtype=int)
+
+        # Need at least 2 TCs
+        if len(tc_idx) < 2:
+            return ev
+
+        starts = []
+        ends   = []
+
+        for k in range(len(tc_idx)):
+            start = tc_idx[k]
+            if k < len(tc_idx) - 1:
+                end = tc_idx[k + 1]
+            else:
+                # last stride cannot form tc2tc window → drop
+                start = None
+                end   = None
+
+            starts.append(start)
+            ends.append(end)
+
+        ev["start"] = starts
+        ev["end"]   = ends
+
+        # Drop last incomplete stride
+        ev = ev.dropna(subset=["start", "end"]).copy()
+
+        return ev
+
+
+    events_imu = enforce_tc2tc_stride_boundaries(events_imu)
 
     # Phase 1.6 z-only integration
     pz, vz = legacy.phase_1_6_integrate_z_only_per_stride_anchor_min_vel(
@@ -325,34 +370,21 @@ def compute_imu_mtc_for_offset(
     pre: Precomputed,
     *,
     toe_x_cm: float,
+    toe_y_cm: float = 0.0,
     toe_z_cm: float,
     ground_mode: str = "min_vel",
+    show_progress: bool = True,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+
     """Run Phase 1.8 for a given (x,z) in cm and return stride-level results."""
 
-    p_toe_b = np.array([toe_x_cm / 100.0, 0.0, toe_z_cm / 100.0], dtype=float)
-    
+    p_toe_b = np.array([toe_x_cm / 100.0, toe_y_cm / 100.0, toe_z_cm / 100.0], dtype=float)
 
     imu_stride_res, debug = legacy.phase_1_8_compute_mtc_per_stride(
         pre.p_imu_w, pre.qs, p_toe_b, pre.events_imu,
         ground_mode=ground_mode,
         half_window=pre.half_window_samples,
-    )
-    return imu_stride_res, (debug or {})
-
-def compute_imu_mtc_for_offset_y(
-    pre: Precomputed,
-    *,
-    toe_y_cm: float,
-    toe_z_cm: float = 0.0,
-    ground_mode: str = "min_vel",
-):
-    p_toe_b = np.array([0.0, toe_y_cm / 100.0, toe_z_cm / 100.0], dtype=float)
-
-    imu_stride_res, debug = legacy.phase_1_8_compute_mtc_per_stride(
-        pre.p_imu_w, pre.qs, p_toe_b, pre.events_imu,
-        ground_mode=ground_mode,
-        half_window=pre.half_window_samples,
+        fs_hz=pre.trial.fs_hz,
     )
     return imu_stride_res, (debug or {})
 
@@ -374,19 +406,18 @@ def score_offset_against_mocap(
     if imu_scored is None or imu_scored.empty:
         return None
 
-    with suppress_stdout():
-        joined, bias, rmse, extra = legacy.phase_1_9_validate_against_mocap(
-            mocap_traj=pre.trial.mocap_traj,
-            events_mocap=pre.trial.events_mocap,
-            toe_marker_name=pre.trial.toe_marker,
-            imu_stride_res=imu_scored,
-            plot=False,
-            quiet=True,
-            verbose=False,
-            ground_mode=ground_mode,
-            half_window=pre.half_window_samples,
-            events_imu=None,
-        )
+    joined, bias, rmse, extra = legacy.phase_1_9_validate_against_mocap(
+        mocap_traj=pre.trial.mocap_traj,
+        events_mocap=pre.trial.events_mocap,
+        toe_marker_name=pre.trial.toe_marker,
+        imu_stride_res=imu_scored,
+        plot=False,
+        quiet=True,
+        verbose=False,
+        ground_mode=ground_mode,
+        half_window=pre.half_window_samples,
+        events_imu=pre.events_imu,
+    )
 
     if bias is None or rmse is None:
         return None
@@ -443,33 +474,38 @@ def calibrate_toe_offset_coarse_to_fine(
     # --- Regularization (normalized) ---
     # Prior means (cm)
     x0_cm = float(np.clip(0.35 * foot_len_cm, search.x_min_cm, search.x_max_cm))
+    y0_cm = 0.0
     z0_cm = 0.0
 
-    # Prior scales (cm) ~ "1 sigma"
-    sig_x_cm = 2.5   # 25 mm: allows variation, prevents x=0 cheating
-    sig_z_cm = 1.5   # 15 mm
+    sig_x_cm = 2.5
+    sig_y_cm = 2.5
+    sig_z_cm = 1.5
 
-    # Regularization weights
     lam_x  = 0.0
+    lam_y  = 0.0          # start 0, let data decide (like x)
     lam_z  = 0.10
-    lam_z0 = 0.05    # extra soft pull toward z≈0 (tie-breaker)
+    lam_z0 = 0.05
 
-    def reg_penalty(x_cm: float, z_cm: float) -> float:
+    def reg_penalty(x_cm: float, y_cm: float, z_cm: float) -> float:
         dx = (x_cm - x0_cm) / sig_x_cm
+        dy = (y_cm - y0_cm) / sig_y_cm
         dz = (z_cm - z0_cm) / sig_z_cm
         dz0 = (z_cm - 0.0) / sig_z_cm
-        return float(lam_x*dx*dx + lam_z*dz*dz + lam_z0*dz0*dz0)
+        return float(lam_x*dx*dx + lam_y*dy*dy + lam_z*dz*dz + lam_z0*dz0*dz0)
 
-
-    def clamp_ranges(x_cm: float, z_cm: float) -> tuple[float, float]:
+    def clamp_ranges(x_cm: float, y_cm: float, z_cm: float) -> tuple[float, float, float]:
         return (
             float(np.clip(x_cm, search.x_min_cm, search.x_max_cm)),
+            float(np.clip(y_cm, search.y_min_cm, search.y_max_cm)),
             float(np.clip(z_cm, search.z_min_cm, search.z_max_cm)),
         )
 
+
     # Coarse grid from CalibrationSearch
     x_start, x_stop, x_step = search.x_coarse_cm
+    y_start, y_stop, y_step = search.y_coarse_cm
     z_start, z_stop, z_step = search.z_coarse_cm
+
 
     def base_score_from_metrics(
         m: Dict[str, Any],
@@ -527,7 +563,7 @@ def calibrate_toe_offset_coarse_to_fine(
         return rmse_m + 0.5 * abs(bias_m)
 
 
-    def multi_test_data_term(x_cm: float, z_cm: float) -> tuple[float, float, float, int, list]:
+    def multi_test_data_term(x_cm: float, y_cm: float, z_cm: float) -> tuple[float, float, float, int, list]:
         """
         Returns:
         data_term (equal-weighted across tests),
@@ -544,7 +580,7 @@ def calibrate_toe_offset_coarse_to_fine(
 
         for pre_t in pres:
             imu_stride_res, _ = compute_imu_mtc_for_offset(
-                pre_t, toe_x_cm=x_cm, toe_z_cm=z_cm, ground_mode=ground_mode
+                pre_t, toe_x_cm=x_cm, toe_y_cm=y_cm, toe_z_cm=z_cm, ground_mode=ground_mode
             )
 
             imu_scored = legacy.apply_stride_mapping_to_imu_results(
@@ -558,21 +594,18 @@ def calibrate_toe_offset_coarse_to_fine(
                 details.append((pre_t.trial.key.test, False, None, None, 0.20))
                 continue
 
-            with suppress_stdout():
-                joined, bias, rmse, extra = legacy.phase_1_9_validate_against_mocap(
-                    mocap_traj=pre_t.trial.mocap_traj,
-                    events_mocap=pre_t.trial.events_mocap,
-                    toe_marker_name=pre_t.trial.toe_marker,
-                    imu_stride_res=imu_scored,
-                    plot=False,
-                    quiet=True,
-                    verbose=False,
-                    ground_mode=ground_mode,
-                    half_window=pre_t.half_window_samples,
-                    events_imu=pre_t.events_imu,
-                )
-
-
+            joined, bias, rmse, extra = legacy.phase_1_9_validate_against_mocap(
+                mocap_traj=pre_t.trial.mocap_traj,
+                events_mocap=pre_t.trial.events_mocap,
+                toe_marker_name=pre_t.trial.toe_marker,
+                imu_stride_res=imu_scored,
+                plot=False,
+                quiet=True,
+                verbose=False,
+                ground_mode=ground_mode,
+                half_window=pre_t.half_window_samples,
+                events_imu=pre_t.events_imu,
+            )
             if joined is None or joined.empty or (not np.isfinite(bias)) or (not np.isfinite(rmse)):
                 d_terms.append(0.20)
                 details.append((pre_t.trial.key.test, False, None, None, 0.20))
@@ -598,115 +631,123 @@ def calibrate_toe_offset_coarse_to_fine(
 
 
     x_grid = np.arange(x_start, x_stop + 1e-9, x_step)
+    y_grid = np.arange(y_start, y_stop + 1e-9, y_step)
     z_grid = np.arange(z_start, z_stop + 1e-9, z_step)
 
-    total = len(x_grid) * len(z_grid)
-    k = 0
 
     # Guarantee z=0 is included (important when z range is not exactly aligned)
     if not np.any(np.isclose(z_grid, 0.0, atol=1e-9)):
         z_grid = np.sort(np.unique(np.append(z_grid, 0.0)))
 
+    nx, ny, nz = len(x_grid), len(y_grid), len(z_grid)
+    print(f"[CAL coarse] x grid: {nx} | y grid: {ny} | z grid: {nz} | total={nx*ny*nz}")
+
+
     best = None
 
-    for x_cm in x_grid:
-        for z_cm in z_grid:
-            x_cm, z_cm = clamp_ranges(x_cm, z_cm)
+    for ix, x_cm in enumerate(x_grid, start=1):
+        print(f"[CAL coarse] x = {x_cm:.2f} cm ({ix}/{nx})")
 
-            data_term, bias_mean, rmse_mean, n_total, details = multi_test_data_term(x_cm, z_cm)
-            score = float(data_term + reg_penalty(x_cm, z_cm))
+        best_x = None  # best candidate within this x slice
 
-            cand = {
-                "toe_x_cm": x_cm,
-                "toe_z_cm": z_cm,
-                "bias_m": bias_mean,
-                "rmse_m": rmse_mean,
-                "n": int(n_total),
-                "data_term_m": float(data_term),
-                "score": score,
-                "per_test": details,
-            }
+        for y_cm in y_grid:
+            for z_cm in z_grid:
+                x_cm2, y_cm2, z_cm2 = clamp_ranges(x_cm, y_cm, z_cm)
 
-            k += 1
+                data_term, bias_mean, rmse_mean, n_total, details = multi_test_data_term(x_cm2, y_cm2, z_cm2)
+                score = float(data_term + reg_penalty(x_cm2, y_cm2, z_cm2))
 
-            if (k == 1) or (k % 20 == 0) or (k == total):
-                print(
-                    f"[CAL coarse] {k}/{total}  "
-                    f"x={x_cm:.2f}  z={z_cm:.2f}  "
-                    f"RMSE={rmse_mean*1000:.2f}mm  "
-                    f"Bias={bias_mean*1000:.2f}mm",
-                    flush=True
-                )
+                cand = {
+                    "toe_x_cm": x_cm2,
+                    "toe_y_cm": y_cm2,
+                    "toe_z_cm": z_cm2,
+                    "bias_m": bias_mean,
+                    "rmse_m": rmse_mean,
+                    "n": int(n_total),
+                    "data_term_m": float(data_term),
+                    "score": score,
+                    "per_test": details,
+                }
 
-            if best is None or cand["score"] < best["score"]:
-                best = cand
+                if best_x is None or cand["score"] < best_x["score"]:
+                    best_x = cand
+
+                if best is None or cand["score"] < best["score"]:
+                    best = cand
+
+        if best_x is not None:
+            print(
+                f"   best@x → y={best_x['toe_y_cm']:.2f} cm  z={best_x['toe_z_cm']:.2f} cm | "
+                f"rmse={best_x['rmse_m']*1000:.2f} mm | "
+                f"bias={best_x['bias_m']*1000:.2f} mm | "
+                f"score={best_x['score']:.4f}"
+            )
 
     # -------------------------
     # Fine grid around best
     # -------------------------
-    cx, cz = float(best["toe_x_cm"]), float(best["toe_z_cm"])
-    # Fine grid from CalibrationSearch
-    x_fine = np.arange(
-        cx - search.x_fine_halfwidth_cm,
-        cx + search.x_fine_halfwidth_cm + 1e-9,
-        search.x_fine_step_cm,
-    )
-    z_fine = np.arange(
-        cz - search.z_fine_halfwidth_cm,
-        cz + search.z_fine_halfwidth_cm + 1e-9,
-        search.z_fine_step_cm,
-    )
+    cx, cy, cz = float(best["toe_x_cm"]), float(best["toe_y_cm"]), float(best["toe_z_cm"])
 
-    total_f = len(x_fine) * len(z_fine)
-    kf = 0
+    x_fine = np.arange(cx - search.x_fine_halfwidth_cm, cx + search.x_fine_halfwidth_cm + 1e-9, search.x_fine_step_cm)
+    y_fine = np.arange(cy - search.y_fine_halfwidth_cm, cy + search.y_fine_halfwidth_cm + 1e-9, search.y_fine_step_cm)
+    z_fine = np.arange(cz - search.z_fine_halfwidth_cm, cz + search.z_fine_halfwidth_cm + 1e-9, search.z_fine_step_cm)
 
-    # Guarantee z=0 is included
     if not np.any(np.isclose(z_fine, 0.0, atol=1e-9)):
         z_fine = np.sort(np.unique(np.append(z_fine, 0.0)))
 
+    nx_f, ny_f, nz_f = len(x_fine), len(y_fine), len(z_fine)
+    print(f"[CAL fine] x grid: {nx_f} | y grid: {ny_f} | z grid: {nz_f} | total={nx_f*ny_f*nz_f}")
 
-    for x_cm in x_fine:
-        for z_cm in z_fine:
-            x_cm, z_cm = clamp_ranges(x_cm, z_cm)
+    for ix, x_cm in enumerate(x_fine, start=1):
+        print(f"[CAL fine] x = {x_cm:.2f} cm ({ix}/{nx_f})")
 
-            data_term, bias_mean, rmse_mean, n_total, details = multi_test_data_term(x_cm, z_cm)
-            score = float(data_term + reg_penalty(x_cm, z_cm))
+        best_x = None
 
-            cand = {
-                "toe_x_cm": x_cm,
-                "toe_z_cm": z_cm,
-                "bias_m": bias_mean,
-                "rmse_m": rmse_mean,
-                "n": int(n_total),
-                "data_term_m": float(data_term),
-                "score": score,
-                "per_test": details,
-            }
+        for y_cm in y_fine:
+            for z_cm in z_fine:
+                x_cm2, y_cm2, z_cm2 = clamp_ranges(x_cm, y_cm, z_cm)
 
-            kf += 1
-            
-            if (kf == 1) or (kf % 50 == 0) or (kf == total_f):
-                print(
-                    f"[CAL fine] {kf}/{total_f}  "
-                    f"x={x_cm:.2f}  z={z_cm:.2f}  "
-                    f"RMSE={rmse_mean*1000:.2f}mm  "
-                    f"Bias={bias_mean*1000:.2f}mm",
-                    flush=True
-                )
+                data_term, bias_mean, rmse_mean, n_total, details = multi_test_data_term(x_cm2, y_cm2, z_cm2)
+                score = float(data_term + reg_penalty(x_cm2, y_cm2, z_cm2))
 
+                cand = {
+                    "toe_x_cm": x_cm2,
+                    "toe_y_cm": y_cm2,
+                    "toe_z_cm": z_cm2,
+                    "bias_m": bias_mean,
+                    "rmse_m": rmse_mean,
+                    "n": int(n_total),
+                    "data_term_m": float(data_term),
+                    "score": score,
+                    "per_test": details,
+                }
 
-            if best is None or cand["score"] < best["score"]:
-                best = cand
+                if best_x is None or cand["score"] < best_x["score"]:
+                    best_x = cand
+
+                if best is None or cand["score"] < best["score"]:
+                    best = cand
+
+        if best_x is not None:
+            print(
+                f"   best@x → y={best_x['toe_y_cm']:.2f} cm  z={best_x['toe_z_cm']:.2f} cm | "
+                f"rmse={best_x['rmse_m']*1000:.2f} mm | "
+                f"bias={best_x['bias_m']*1000:.2f} mm | "
+                f"score={best_x['score']:.4f}"
+            )
+
 
     # Attach priors for logging
     best["shoe_size_prior"] = float(shoe_size) if shoe_size is not None else np.nan
     best["x0_cm_prior"] = float(x0_cm)
     best["z0_cm_prior"] = float(z0_cm)
+    best["y0_cm_prior"] = float(y0_cm)
     best["lam_x"] = float(lam_x)
     best["lam_z"] = float(lam_z)
+    best["lam_y"] = float(lam_y)
     best["lam_z0"] = float(lam_z0)
     best["sig_x_cm"] = float(sig_x_cm)
     best["sig_z_cm"] = float(sig_z_cm)
-
+    best["sig_y_cm"] = float(sig_y_cm)
 
     return best

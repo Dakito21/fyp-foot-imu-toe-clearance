@@ -22,6 +22,7 @@ python MFC_dataset_testing.py `
 """
 
 import argparse
+from doctest import debug
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,6 +30,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import butter, filtfilt
 import matplotlib.pyplot as plt
+import math
 from joblib import Memory
 
 from gaitmap_datasets.sensor_position_comparison_2019 import SensorPositionComparison2019Mocap
@@ -179,6 +181,53 @@ def _robust_mad(x: np.ndarray) -> float:
     med = np.median(x)
     return float(np.median(np.abs(x - med))) + 1e-12
 
+def _robust_ground_from_window(
+    win,
+    *,
+    detrend=True,
+    low_q=10.0,          # use 10th percentile as "ground-ish"
+    lowest_frac=0.20,    # or median of lowest 20% samples
+    mode="lowest_frac",  # "lowest_frac" or "quantile"
+):
+    """
+    Robust ground level estimate from a stance window of toe_z samples.
+
+    Key idea: stance has rocker (heel->toe) so the median can be above true ground.
+    We estimate ground from the *lowest* portion of the stance samples.
+
+    - Optionally detrend with a line (handles slight slope / drift within stance).
+    - Then take either:
+        * quantile(win_flat, low_q), OR
+        * median of the lowest `lowest_frac` samples.
+    - Add back the trend evaluated at the window midpoint.
+    """
+    win = np.asarray(win, dtype=float)
+    if win.size < 3:
+        return float(np.median(win))
+
+    if detrend:
+        x = np.arange(win.size, dtype=float)
+        m, c = np.polyfit(x, win, 1)
+        trend = m * x + c
+        win_flat = win - trend
+
+        # reference point to add trend back (midpoint is stable)
+        x0 = 0.5 * (win.size - 1)
+        trend0 = m * x0 + c
+    else:
+        win_flat = win
+        trend0 = 0.0
+
+    if mode == "quantile":
+        g_flat = float(np.percentile(win_flat, low_q))
+    else:
+        # median of lowest fraction
+        k = max(3, int(np.floor(lowest_frac * win_flat.size)))
+        idx = np.argpartition(win_flat, k - 1)[:k]
+        g_flat = float(np.median(win_flat[idx]))
+
+    return g_flat + float(trend0)
+
 ##############################################################################
 # Signal processing / filtering
 ##############################################################################
@@ -294,8 +343,6 @@ def phase_1_3_filter_imu(imu, fs_hz, cutoff_hz=20.0, *, dynamic=False):
       - fixed cutoff_hz (legacy), or
       - dynamic cutoffs based on step frequency (recommended).
     """
-    import numpy as np
-
     imu_f = imu.copy()
 
     if dynamic:
@@ -1145,7 +1192,7 @@ def refine_ic_with_specific_acc(
       - set early-pull limit as fraction of stride duration (with clamps)
     """
     n = len(specific_acc_w)
-    az = specific_acc_w[:, 2] 
+    feat = np.abs(specific_acc_w[:, 2])  # vertical specific accel magnitude
 
     out = events_imu.copy()
     if "ic" not in out.columns or out["ic"].isna().all():
@@ -1155,19 +1202,31 @@ def refine_ic_with_specific_acc(
     ic_idx = out["ic"].to_numpy(dtype=float)
 
     stride_samples = np.full(len(out), np.nan, dtype=float)
-    if dynamic and stride_ref == "ic2ic":
+
+    if dynamic:
+        if stride_ref == "ic2ic":
+            t_idx = out["ic"].to_numpy(dtype=float)
+        elif stride_ref == "tc2tc":
+            # needs tc present
+            if "tc" not in out.columns:
+                t_idx = np.full(len(out), np.nan, dtype=float)
+            else:
+                t_idx = out["tc"].to_numpy(dtype=float)
+        else:
+            raise ValueError("stride_ref must be 'ic2ic' or 'tc2tc'")
+
         for i in range(len(out) - 1):
-            if np.isfinite(ic_idx[i]) and np.isfinite(ic_idx[i + 1]):
-                d = int(ic_idx[i + 1]) - int(ic_idx[i])
-                # reject junk (<0.3s or >3s)
+            if np.isfinite(t_idx[i]) and np.isfinite(t_idx[i + 1]):
+                d = int(t_idx[i + 1]) - int(t_idx[i])
                 if 60 <= d <= int(3.0 * fs_hz):
                     stride_samples[i] = d
 
         med_stride = np.nanmedian(stride_samples)
         if not np.isfinite(med_stride):
-            med_stride = int(1.0 * fs_hz)  # fallback 1s stride
+            med_stride = int(1.0 * fs_hz)
     else:
-        med_stride = None  # unused
+        med_stride = None
+
 
     ic_refined = []
 
@@ -1179,23 +1238,18 @@ def refine_ic_with_specific_acc(
         pos = int(r["_pos"])
         ic0 = int(r["ic"])
 
+        if not dynamic:
+            ...
+            ic_refined.append(ic_new)
+            continue
+
+        # --- dynamic windows based on stride length ---
         ss = stride_samples[pos] if np.isfinite(stride_samples[pos]) else med_stride
-        if not np.isfinite(ss) or ss <= 0:
-            ss = int(1.0 * fs_hz)
 
-        # Fix B insertion (cadence-adaptive fracs)
-        stride_s = ss / fs_hz
-        if stride_s >= 1.25:
-            pre_frac_eff = 0.20; post_frac_eff = 0.03; max_early_pull_frac_eff = 0.05
-        elif stride_s >= 1.10:
-            pre_frac_eff = 0.16; post_frac_eff = 0.03; max_early_pull_frac_eff = 0.04
-        else:
-            pre_frac_eff = pre_frac; post_frac_eff = post_frac; max_early_pull_frac_eff = max_early_pull_frac
+        pre_s_i = float(np.clip(pre_frac * ss / fs_hz, pre_bounds_s[0], pre_bounds_s[1]))
+        post_s_i = float(np.clip(post_frac * ss / fs_hz, post_bounds_s[0], post_bounds_s[1]))
 
-        pre_s_i  = float(np.clip(pre_frac_eff  * ss / fs_hz, pre_bounds_s[0],  pre_bounds_s[1]))
-        post_s_i = float(np.clip(post_frac_eff * ss / fs_hz, post_bounds_s[0], post_bounds_s[1]))
-
-        w_pre  = int(round(pre_s_i  * fs_hz))
+        w_pre = int(round(pre_s_i * fs_hz))
         w_post = int(round(post_s_i * fs_hz))
 
         a = max(0, ic0 - w_pre)
@@ -1204,44 +1258,15 @@ def refine_ic_with_specific_acc(
             ic_refined.append(ic0)
             continue
 
-        seg = az[a:b]
-        k_max = a + int(np.argmax(seg))
-        k_min = a + int(np.argmin(seg))
+        ic_new = a + int(np.argmax(feat[a:b]))
 
-        def sharpness_at(k):
-            w = int(round(0.02 * fs_hz))
-            aa = max(0, k - w); bb = min(n, k + w + 1)
-            return float(np.abs(az[k] - np.median(az[aa:bb])))
-
-        k1 = k_max if sharpness_at(k_max) >= sharpness_at(k_min) else k_min
-        ic_new = k1
-
-
-        # Clamp first (early/late)
         max_early_pull_s = float(np.clip(
-            max_early_pull_frac_eff * ss / fs_hz,
+            max_early_pull_frac * ss / fs_hz,
             max_early_pull_bounds_s[0],
             max_early_pull_bounds_s[1],
         ))
         max_early_pull = int(round(max_early_pull_s * fs_hz))
         ic_new = max(ic_new, ic0 - max_early_pull)
-
-        max_late_push = int(round(0.03 * fs_hz))
-        ic_new = min(ic_new, ic0 + max_late_push)
-
-        # Sharpness gate at the FINAL ic_new
-        k = ic_new
-        w = int(round(0.02 * fs_hz))
-        aa = max(0, k - w)
-        bb = min(n, k + w + 1)
-        local = az[aa:bb]
-        sharp = float(az[k] - np.median(local))
-
-        # looser threshold for slow strides
-        thr = 0.7 if stride_s >= 1.10 else 1.0
-        if sharp < thr:
-            ic_refined.append(ic0)
-            continue
 
         ic_refined.append(ic_new)
 
@@ -1274,6 +1299,16 @@ def phase_1_4_get_zupt_mask_from_min_vel(
     if ev.empty:
         return zupt
 
+    if not dynamic:
+        hw = int(half_window)
+        for _, row in ev.iterrows():
+            mv = int(row["min_vel"])
+            a = max(0, mv - hw)
+            b = min(n_samples, mv + hw + 1)
+            zupt[a:b] = True
+        return zupt
+
+    # --- dynamic mode ---
     if fs_hz is None or fs_hz <= 0:
         fs_hz = 200.0  # fallback
 
@@ -1538,13 +1573,10 @@ def phase_1_5b_stance_attitude_correction(
         best_i = int(np.argmax(scores))
         q_curr_new = _quat_norm(cand[best_i])
 
+        # Optional: only accept if it improves
         if scores[best_i] > score0 + 1e-3:
-            q_curr = _quat_norm(cand[best_i])
+            q_curr = q_curr_new
         # else: keep q_curr unchanged
-
-        # Update cumulative correction
-        q_curr = quat_mul(q_curr, q_corr_b)
-        q_curr = _quat_norm(q_curr)
 
         last_mv = mv
 
@@ -1581,46 +1613,20 @@ def phase_1_5_compute_world_acceleration(imu_f, qs):
 
     return acc_w
 
-def phase_1_5_remove_gravity(acc_w, zupt_mask, fs_hz=200.0, tau_s=1.5):
-    n = len(acc_w)
-
+def phase_1_5_remove_gravity(acc_w, zupt_mask):
     if zupt_mask is None or (not np.any(zupt_mask)):
         g_hat = np.median(acc_w, axis=0)
-        specific_acc_w = acc_w - g_hat
-        print(f"[Phase 1.5] Gravity removal: global median(all) | g_hat={g_hat} | |g_hat|={np.linalg.norm(g_hat):.3f}")
-        return specific_acc_w, "acc_w - global g_hat"
-    
-    # Build time-varying g_hat: only update from stance samples, then smooth
-    g_series = np.zeros_like(acc_w)
-    g_series[:] = np.nan
-    g_series[zupt_mask] = acc_w[zupt_mask]
+        ref = "all"
+    else:
+        g_hat = np.median(acc_w[zupt_mask], axis=0)
+        ref = "stance"
 
-    # forward-fill + back-fill NaNs
-    for j in range(3):
-        col = g_series[:, j]
-        # ffill
-        last = np.nan
-        for i in range(n):
-            if np.isfinite(col[i]): last = col[i]
-            else: col[i] = last
-        # bfill
-        last = np.nan
-        for i in range(n-1, -1, -1):
-            if np.isfinite(col[i]): last = col[i]
-            else: col[i] = last
-        g_series[:, j] = col
+    # g_hat is a 3D vector (not forced to z-axis)
+    specific_acc_w = acc_w - g_hat
 
-    # Smooth with EMA
-    alpha = 1.0 - np.exp(-1.0 / (tau_s * fs_hz))
-    g_hat_t = np.zeros_like(acc_w)
-    g_hat_t[0] = g_series[0]
-    for i in range(1, n):
-        g_hat_t[i] = (1 - alpha) * g_hat_t[i-1] + alpha * g_series[i]
+    print(f"[Phase 1.5] Gravity removal: acc_w - g_hat(median {ref}) | g_hat={g_hat} | |g_hat|={np.linalg.norm(g_hat):.3f}")
+    return specific_acc_w, "acc_w - g_hat(median stance)"
 
-    specific_acc_w = acc_w - g_hat_t
-    g0 = g_hat_t[int(np.argmax(zupt_mask))]  # representative print
-    print(f"[Phase 1.5] Gravity removal: time-varying g_hat(stance EMA, tau={tau_s:.1f}s) | g_hat~{g0} | |g_hat|~{np.linalg.norm(g0):.3f}")
-    return specific_acc_w, "acc_w - g_hat(t)"
 
 ##############################################################################
 # Integration / kinematics
@@ -1816,9 +1822,24 @@ def phase_1_8_compute_mtc_per_stride(p_imu_w, qs, p_toe_b, events_imu, ground_mo
         tc    = int(row["tc"])
         ic    = int(row["ic"])
 
+        # --- IC safety clamp (prevents refined IC from breaking tc2tc stride window) ---
+        min_gap = int(round(0.05 * fs_hz))  # 50 ms minimum swing
+        ic_orig = ic
+
+        if ic <= tc + min_gap:
+            ic = tc + min_gap
+
+        if ic >= end - min_gap:
+            ic = end - min_gap
+
+        if ic != ic_orig:
+            REJ("ic_clamped")   # optional but very useful
+
         # Swing should be tc -> ic, and must lie within [start, end]
         if not (start <= tc < ic <= end):
+            REJ("bad_stride_bounds")
             continue
+
         if ic >= n or tc < 0 or ic <= tc + 5:
             continue
 
@@ -1888,18 +1909,14 @@ def phase_1_8_compute_mtc_per_stride(p_imu_w, qs, p_toe_b, events_imu, ground_mo
 
         _, ground_mode_used, gw_a, gw_b, ground_win, ground_sigma_hat, ground_iqr = best
 
-
-
-        x = np.arange(len(ground_win), dtype=float)
-
-        if len(ground_win) >= 3:
-            m, c = np.polyfit(x, ground_win, 1)
-            trend = m * x + c
-            ground_win_flat = ground_win - trend
-            ground_level = np.median(ground_win_flat)
-            ground = ground_level + c   # add back intercept
-        else:
-            ground = float(np.median(ground_win))
+        # robust ground estimate from lowest stance samples (reduces rocker bias)
+        ground = _robust_ground_from_window(
+            ground_win,
+            detrend=True,
+            mode="lowest_frac",   # change to "quantile" if you prefer
+            lowest_frac=0.20,     # median of lowest 20% samples
+            low_q=10.0,           # used only if mode="quantile"
+        )
 
         # --- Swing window: compute MTC (simple + non-lethal) ---
         swing_len = ic - tc
@@ -1914,55 +1931,13 @@ def phase_1_8_compute_mtc_per_stride(p_imu_w, qs, p_toe_b, events_imu, ground_mo
             a_sw = tc + t
             b_sw = ic - t
 
-        seg = toe_z[a_sw:b_sw] - ground
+        if b_sw <= a_sw + 5:
+            REJ("swing_too_short")
+            continue
 
-        # Light smoothing for candidate finding ONLY (keep raw value for reporting)
-        w = max(5, int(round(0.015 * fs_hz)))  # ~15 ms
-        w = w + 1 if (w % 2 == 0) else w
-        kernel = np.ones(w) / w
-        seg_s = np.convolve(seg, kernel, mode="same")
-
-        # Find K lowest candidates from smoothed (robust to noise)
-        K = 5
-        cand_idx = np.argsort(seg_s)[:K]
-
-        best_k = None
-        best_score = None
-        for ci in cand_idx:
-            k = a_sw + int(ci)
-
-            # slope check on RAW clearance around k
-            w2 = int(round(0.02 * fs_hz))  # 20 ms
-            aa = max(a_sw, k - w2)
-            bb = min(b_sw, k + w2 + 1)
-            local = toe_z[aa:bb] - ground
-
-            if len(local) < 5:
-                continue
-
-            # Compute slope in m/s (normalized by dt)
-            dt = 1.0 / fs_hz
-            d = np.diff(local)
-            if len(d) == 0:
-                continue
-
-            slope = float(np.median(np.abs(d)) / dt)  # m/s
-
-            raw_clear = float(seg[ci])
-            score = raw_clear + 0.02 * slope  # tune weight if needed
-
-            if (best_score is None) or (score < best_score):
-                best_score = score
-                best_k = k
-
-        if best_k is None:
-            # fallback to original
-            mtc = float(np.min(seg))
-            mtc_idx = a_sw + int(np.argmin(seg))
-        else:
-            mtc_idx = best_k
-            mtc = float(toe_z[mtc_idx] - ground)
-
+        swing_clearance = toe_z[a_sw:b_sw] - ground
+        mtc = float(np.min(swing_clearance))
+        mtc_idx = a_sw + int(np.argmin(swing_clearance))
         mtc_rel_pct = (mtc_idx - tc) / max(1, (ic - tc))
 
         # Log edge-min tendency (do NOT reject)
@@ -2182,36 +2157,156 @@ def apply_stride_mapping_to_imu_results(
 # Validation + plotting
 ##############################################################################
 
-def plot_one_stride_clearance(s_id, debug):
-    toe_z = debug["toe_z"]
+def plot_one_stride_clearance(s_id, debug, *, ax=None, title=None, show=True):
+    """
+    If ax is provided, draw into that axes (for subplot grids).
+    If ax is None, create a new figure.
+    """
+    toe_z = debug["toe_z"]                     # IMU toe z in meters (world)
     sd = debug["stride_debug"][s_id]
 
-    start, end = sd["start"], sd["end"]
-    tc, ic = sd["tc"], sd["ic"]
-    mv = sd["min_vel"]
-    ground = sd["ground_z"]
-    gw_a, gw_b = sd["ground_win_a"], sd["ground_win_b"]
+    start, end = int(sd["start"]), int(sd["end"])
+    tc, ic = int(sd["tc"]), int(sd["ic"])
+    mv = sd.get("min_vel", None)
+    ground = float(sd["ground_z"])             # IMU ground z in meters
+    gw_a, gw_b = int(sd["ground_win_a"]), int(sd["ground_win_b"])
 
+    # --- IMU clearance (mm) ---
     clearance_mm = (toe_z - ground) * 1000.0
 
-    swing = clearance_mm[tc:ic]
-    i_min = tc + int(np.argmin(swing))
+    n = len(clearance_mm)
+    # clamp all indices to valid plotting range
+    start = max(0, min(start, n - 1))
+    end   = max(start + 1, min(end, n))
+    tc    = max(0, min(tc, n - 1))
+    ic    = max(0, min(ic, n))
+    gw_a  = max(0, min(gw_a, n - 1))
+    gw_b  = max(gw_a + 1, min(gw_b, n))
 
-    plt.figure()
-    plt.plot(np.arange(start, end), clearance_mm[start:end])
-    plt.axhline(0.0)
-    plt.axvline(tc, linestyle="--", label="TC")
-    plt.axvline(ic, linestyle="--", label="IC")
-    if mv is not None:
-        plt.axvline(mv, linestyle=":", label="min_vel")
-    plt.axvspan(gw_a, gw_b, alpha=0.2, label="ground window")
-    plt.scatter([i_min], [clearance_mm[i_min]], marker="x", s=80, label=f"min={clearance_mm[i_min]:.1f}mm")
-    plt.title(f"Stride {s_id} clearance (IMU)")
-    plt.xlabel("Sample index")
-    plt.ylabel("Clearance (mm)")
-    plt.grid(True)
-    plt.legend()
+    if ic <= tc:
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+        ax.set_title(title or f"Stride {s_id} (invalid swing window)")
+        ax.axis("off")
+        if show:
+            plt.show(block=True)
+        return
+
+    swing = clearance_mm[tc:ic]
+    i_min = tc + int(np.nanargmin(swing))
+
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+
+    x = np.arange(start, end)
+    y = clearance_mm[start:end]
+
+    ax.plot(x, y, label="IMU")
+
+    # --- MoCap overlay (if provided) ---
+    mocap_y = None
+
+    # Option A: already-provided clearance (mm), aligned to IMU index
+    mcc = debug.get("mocap_clearance_mm", None)
+    if mcc is not None and len(mcc) >= end:
+        mocap_y = np.asarray(mcc[start:end], dtype=float)
+
+    # Option B (robust): mocap toe z (m) aligned to IMU; estimate a scalar ground from the stride ground window
+    if mocap_y is None:
+        mtz = debug.get("mocap_toe_z_m", None)
+        if mtz is not None and len(mtz) >= end:
+            mtz = np.asarray(mtz, dtype=float)
+
+            # Use the same stride-anchored "ground window" you already plot.
+            # Robust ground estimate: 5th percentile in that window.
+            gw_slice = mtz[gw_a:gw_b]
+            if gw_slice.size >= 5 and np.any(np.isfinite(gw_slice)):
+                mocap_ground = np.nanpercentile(gw_slice, 5)
+            else:
+                # fallback: 5th percentile of the stride segment
+                seg = mtz[start:end]
+                mocap_ground = np.nanpercentile(seg[np.isfinite(seg)], 5) if np.any(np.isfinite(seg)) else np.nan
+
+            if np.isfinite(mocap_ground):
+                mocap_y = (mtz[start:end] - mocap_ground) * 1000.0
+
+    # Option C (last resort): per-sample mocap ground z (m) aligned to IMU
+    if mocap_y is None:
+        mtz = debug.get("mocap_toe_z_m", None)
+        mgz = debug.get("mocap_ground_z_m", None)
+        if (mtz is not None) and (mgz is not None) and (len(mtz) >= end) and (len(mgz) >= end):
+            mocap_y = (np.asarray(mtz[start:end], float) - np.asarray(mgz[start:end], float)) * 1000.0
+
+    if mocap_y is not None and np.any(np.isfinite(mocap_y)):
+        ax.plot(x, mocap_y, label="MoCap")
+
+        # MoCap MTC marker (min over TC->IC in same IMU index window)
+        a = max(0, tc - start)
+        b = min(len(mocap_y), ic - start)
+        mocap_swing = mocap_y[a:b]
+        if mocap_swing.size > 0 and np.any(np.isfinite(mocap_swing)):
+            j_local = int(np.nanargmin(mocap_swing))
+            j_min = start + a + j_local
+            ax.scatter([j_min], [mocap_y[j_min - start]], marker="o", s=60,
+                       label=f"MoCap min={mocap_y[j_min-start]:.1f}mm")
+
+    # Reference lines
+    ax.axhline(0.0)
+    ax.axvline(tc, linestyle="--", label="TC")
+    ax.axvline(ic, linestyle="--", label="IC")
+    if mv is not None and np.isfinite(mv):
+        ax.axvline(int(mv), linestyle=":", label="min_vel")
+
+    ax.axvspan(gw_a, gw_b, alpha=0.2, label="ground window")
+    ax.scatter([i_min], [clearance_mm[i_min]], marker="x", s=80,
+               label=f"IMU min={clearance_mm[i_min]:.1f}mm")
+
+    ax.set_title(title or f"Stride {s_id} clearance (IMU vs MoCap)")
+    ax.set_xlabel("Sample index (IMU)")
+    ax.set_ylabel("Clearance (mm)")
+    ax.grid(True)
+    ax.legend(fontsize=8)
+
+    if show:
+        plt.show(block=True)
+
+
+def plot_stride_grid_clearance(stride_id: int, debug_by_test: dict, *, ncols: int = 3, suptitle: str = ""):
+    """
+    debug_by_test: dict[test_name] = debug dict from phase_1_8_compute_mtc_per_stride
+    """
+    keys = list(debug_by_test.keys())
+    if not keys:
+        return
+
+    n = len(keys)
+    ncols = max(1, int(ncols))
+    nrows = int(math.ceil(n / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 3.2 * nrows), squeeze=False)
+    axes = axes.ravel()
+
+    for i, test_name in enumerate(keys):
+        ax = axes[i]
+        dbg = debug_by_test[test_name]
+
+        ok = (dbg is not None) and ("stride_debug" in dbg) and (stride_id in dbg["stride_debug"])
+        if not ok:
+            ax.set_title(f"{test_name}\n(no stride {stride_id})")
+            ax.axis("off")
+            continue
+
+        plot_one_stride_clearance(int(stride_id), dbg, ax=ax, title=test_name, show=False)
+
+    for j in range(n, len(axes)):
+        axes[j].axis("off")
+
+    if suptitle:
+        fig.suptitle(suptitle)
+
+    fig.tight_layout()
     plt.show(block=True)
+
 
 def plot_imu_mocap_events_window(
     imu_f: pd.DataFrame,
@@ -2321,12 +2416,19 @@ def phase_1_9_validate_against_mocap(
         if end <= ic + 2 or end >= len(toe_z):
             continue
 
+        # inside the stride loop, replace the mv selection with this:
         mv = None
-        if ground_mode == "min_vel":
-            if ("min_vel" in row) and (not pd.isna(row["min_vel"])):
-                mv = int(row["min_vel"])
-            elif events_imu is not None and s_id in events_imu.index and not pd.isna(events_imu.loc[s_id, "min_vel"]):
-                mv = int(events_imu.loc[s_id, "min_vel"])
+        if ground_mode in ("min_vel", "imu_min_vel"):
+            if ground_mode == "imu_min_vel":
+                if events_imu is not None and s_id in events_imu.index and not pd.isna(events_imu.loc[s_id, "min_vel"]):
+                    mv = int(events_imu.loc[s_id, "min_vel"])
+            else:
+                # legacy behavior: prefer MoCap min_vel, fallback to IMU
+                if ("min_vel" in row) and (not pd.isna(row["min_vel"])):
+                    mv = int(row["min_vel"])
+                elif events_imu is not None and s_id in events_imu.index and not pd.isna(events_imu.loc[s_id, "min_vel"]):
+                    mv = int(events_imu.loc[s_id, "min_vel"])
+
 
 
         if ground_mode == "min_vel" and mv is not None:
@@ -2336,7 +2438,8 @@ def phase_1_9_validate_against_mocap(
         else:
             ground = float(np.median(toe_z[ic:end]))
 
-       # use local copy for this stride only
+        # ---- Enforce toe_z(ic-) = ground by shifting swing only ----
+        # use local copy for this stride only
         swing_seg = toe_z[tc:ic].copy()
         # enforce end closure on the swing copy only
         toe_z_end = swing_seg[-1] - ground
@@ -2347,7 +2450,6 @@ def phase_1_9_validate_against_mocap(
 
         swing_clearance = swing_seg - ground
         mtc = float(np.min(swing_clearance))
-
         gt_rows.append({"s_id": s_id, "mtc_mocap_m": mtc})
 
     mocap_stride_res = pd.DataFrame(gt_rows)
@@ -2431,11 +2533,6 @@ def phase_1_9_validate_against_mocap(
         "err_m": "err_mm",
         "abs_err_m": "abs_err_mm",
     })
-
-
-    # ---- Debug: Top absolute errors ----
-    print("\n[Phase 1.9] Top 5 absolute errors (by stride id):")
-    print(top5_mm.round(2).to_string())
 
     if stride_errors_path is not None:
         joined_dbg.to_csv(stride_errors_path, index=True)
@@ -2674,6 +2771,7 @@ def run_pipeline_for_row_report(
     test: str,
     side: str,
     toe_x_cm: float,
+    toe_y_cm: float,
     toe_z_cm: float,
     sensor: str | None = None,
     toe_marker: str | None = None,
@@ -2689,7 +2787,9 @@ def run_pipeline_for_row_report(
     dynamic_zupt: bool = True,
     dynamic_ic_refine: bool = True,
     dynamic_cutoff: bool = True,
-    calibrate_toe_offset: bool = False,
+    return_debug: bool = False,
+    debug_plot: bool = False,
+    debug_stride_id: int | None = None,
 ):
     """
     Run IMU-only pipeline for one (participant,test,side) using *pre-calibrated* toe offsets.
@@ -2708,10 +2808,10 @@ def run_pipeline_for_row_report(
         data_padding_s=float(padding_s),
     )
 
-    SAVE_STRIDE_ERRORS_FOR = "fast_10"   # change whenever you want
+    STRIDE_CLOCK = "tc2tc"   # or "ic2ic"
 
-    DEBUG_TEST = "fast_10"
-    DEBUG_STRIDE_ID = 10   # change to whichever stride you want
+    SAVE_STRIDE_ERRORS_FOR = "slow_20"   # change whenever you want
+
 
     subset = dataset.get_subset(participant=[participant], test=[test])
     if len(subset) == 0:
@@ -2737,7 +2837,7 @@ def run_pipeline_for_row_report(
 
 
     # Fixed toe offset (cm -> m)
-    p_toe_b = np.array([toe_x_cm / 100.0, 0.0, toe_z_cm / 100.0], dtype=float)
+    p_toe_b = np.array([toe_x_cm/100.0, toe_y_cm/100.0, toe_z_cm/100.0], dtype=float)
 
     # Phase 1.1 objective (constant; keep it explicit in output)
     phase_cfg = phase_1_1_define_mtc_objective()
@@ -2777,7 +2877,7 @@ def run_pipeline_for_row_report(
         frac=0.03,
         min_hw=6,
         max_hw=25,
-        stride_ref="ic2ic",
+        stride_ref=STRIDE_CLOCK,
     )
 
     # Phase 1.5
@@ -2817,7 +2917,7 @@ def run_pipeline_for_row_report(
         dynamic=dynamic_ic_refine,
         pre_frac=0.12,
         post_frac=0.03,
-        stride_ref="ic2ic",
+        stride_ref=STRIDE_CLOCK,
     )
 
     # Phase 1.6 (z-only)
@@ -2833,38 +2933,123 @@ def run_pipeline_for_row_report(
     p_imu_w[:, 2] = pz
 
     # Phase 1.8
-    if calibrate_toe_offset:
-        best = calibrate_toe_offset_fast(
-            p_imu_w=p_imu_w,
-            qs=qs,
-            events_imu=events_imu,
-            events_gt_imu=events_gt_imu,
-            mocap_traj=mocap_traj,
-            events_mocap=events_mocap,
-            toe_marker_name=toe_marker,
-            fs_hz=fs_hz,
-            half_window=half_window_samples,
-        )
-        toe_x_cm = best["x_cm"]
-        toe_z_cm = best["z_cm"]
-        p_toe_b = np.array([toe_x_cm/100.0, 0.0, toe_z_cm/100.0])
-
+    
     # Now compute final IMU MTC once using best offset
     imu_stride_res, debug = phase_1_8_compute_mtc_per_stride(
         p_imu_w, qs, p_toe_b, events_imu,
-        ground_mode="min_vel", half_window=half_window_samples
+        ground_mode="min_vel", half_window=half_window_samples, fs_hz=fs_hz
     )
 
+    # -----------------------------
+    # MoCap overlay prep (robust)
+    # -----------------------------
+    if debug is not None:
+        N = len(imu_f)
+        fs_imu = float(fs_hz)
+        t_imu = np.arange(N, dtype=float) / fs_imu  # seconds (IMU)
 
-    # ---- DEBUG: plot a specific stride for a specific test ----
-    if test == DEBUG_TEST and DEBUG_STRIDE_ID is not None:
-        if debug is not None and "stride_debug" in debug and DEBUG_STRIDE_ID in debug["stride_debug"]:
-            force_print(f"\n[DEBUG] Plotting stride {DEBUG_STRIDE_ID} for {participant} {test} {side}")
-            plot_one_stride_clearance(int(DEBUG_STRIDE_ID), debug)
+        toe_mocap = mocap_traj[toe_marker]
+
+        # In many mocap datasets, "y" is the vertical/up axis. "z" is often forward.
+        up_candidates = ["y", "pos_y", "z", "pos_z", "x", "pos_x"]
+        up_col = next((c for c in up_candidates if c in toe_mocap.columns), None)
+        if up_col is None:
+            raise RuntimeError("Could not find MoCap position column (expected x/y/z or pos_x/pos_y/pos_z).")
+
+        # Optional sanity: print ranges to confirm we picked the vertical axis
+        cols = [c for c in ["x","y","z","pos_x","pos_y","pos_z"] if c in toe_mocap.columns]
+        if cols:
+            rng = {c: (np.nanpercentile(toe_mocap[c].to_numpy(float), 99) -
+                    np.nanpercentile(toe_mocap[c].to_numpy(float), 1)) for c in cols}
+            print(f"[DBG MoCap axes] ranges p1..p99 (m): {rng} | using up_col='{up_col}'")
+
+        z_mocap = toe_mocap[up_col].to_numpy(dtype=float)
+
+
+        # ---- Estimate mocap sampling rate and time offset using matched events ----
+        # events_mocap: indices in mocap axis (likely frames)
+        # events_gt_imu: same events converted to imu axis (samples)
+        em = events_mocap.dropna(subset=["ic", "tc"]).reset_index(drop=True)
+        ei = events_gt_imu.dropna(subset=["ic", "tc"]).reset_index(drop=True)
+
+        # Use ICs (more stable) if possible; fallback to TCs.
+        if len(em) >= 3 and len(ei) >= 3:
+            m_idx = em["ic"].to_numpy(dtype=float)
+            i_idx = ei["ic"].to_numpy(dtype=float)
         else:
-            force_print(f"[DEBUG] Stride {DEBUG_STRIDE_ID} not found in debug['stride_debug'] for {test}. "
-                        f"Available example ids: {list(debug['stride_debug'].keys())[:10]}")
+            m_idx = em["tc"].to_numpy(dtype=float)
+            i_idx = ei["tc"].to_numpy(dtype=float)
 
+        if m_idx.size < 3 or i_idx.size < 3:
+            raise RuntimeError("Not enough paired MoCap/IMU events to estimate MoCap time axis.")
+
+        # Robust slope: fs_mocap = fs_imu * (Δmocap / Δimu)
+        dm = np.diff(m_idx)
+        di = np.diff(i_idx)
+        good = (dm > 0) & (di > 0)
+        if not np.any(good):
+            raise RuntimeError("Event diffs invalid; cannot estimate MoCap sampling rate.")
+
+        fs_mocap = fs_imu * float(np.median(dm[good] / di[good]))
+
+        # Alignment offset using first valid event pair:
+        # t_imu(event) = i_idx/fs_imu
+        # t_mocap(event) = m_idx/fs_mocap
+        # t0 = t_imu - t_mocap
+        t0 = float((i_idx[0] / fs_imu) - (m_idx[0] / fs_mocap))
+
+        # Build mocap time axis in seconds (aligned to IMU time origin)
+        t_mocap = (np.arange(len(z_mocap), dtype=float) / fs_mocap) + t0
+
+        # Interpolate MoCap toe-z onto IMU time axis
+        mocap_toe_z_m = np.interp(t_imu, t_mocap, z_mocap)
+
+        # Compute MoCap "ground" per stride using same IMU ground windows
+        mocap_ground_z_m = np.full_like(mocap_toe_z_m, np.nan)
+        for sid, sd in debug.get("stride_debug", {}).items():
+            a = int(sd["ground_win_a"]); b = int(sd["ground_win_b"])
+            a = max(a, 0); b = min(b, N)
+            if b <= a:
+                continue
+
+            g = np.nanmedian(mocap_toe_z_m[a:b])
+
+            start = int(sd["start"]); end = int(sd["end"])
+            start = max(start, 0); end = min(end, N)
+            if end <= start:
+                continue
+
+            mocap_ground_z_m[start:end] = g
+
+        # Fill remaining NaNs (forward then backward)
+        if np.any(~np.isfinite(mocap_ground_z_m)):
+            last = np.nan
+            for k in range(N):
+                if np.isfinite(mocap_ground_z_m[k]): last = mocap_ground_z_m[k]
+                else: mocap_ground_z_m[k] = last
+            last = np.nan
+            for k in range(N - 1, -1, -1):
+                if np.isfinite(mocap_ground_z_m[k]): last = mocap_ground_z_m[k]
+                else: mocap_ground_z_m[k] = last
+
+        debug["mocap_toe_z_m"] = mocap_toe_z_m
+        debug["mocap_ground_z_m"] = mocap_ground_z_m
+        debug["mocap_clearance_mm"] = (mocap_toe_z_m - mocap_ground_z_m) * 1000.0
+
+        # Optional sanity print (helps catch unit/time issues fast)
+        rng = np.nanpercentile(debug["mocap_clearance_mm"], [1, 99])
+        print(f"[DBG MoCap overlay] fs_mocap≈{fs_mocap:.1f} Hz | clearance_mm p1..p99={rng[0]:.1f}..{rng[1]:.1f}")
+
+
+    # ---- Optional debug plot for this test call ----
+    if debug_plot and (debug_stride_id is not None):
+        sid = int(debug_stride_id)
+        if debug is not None and "stride_debug" in debug and sid in debug["stride_debug"]:
+            force_print(f"\n[DEBUG] Plotting stride {sid} for {participant} {test} {side}")
+            plot_one_stride_clearance(sid, debug)
+        else:
+            avail = list(debug["stride_debug"].keys())[:10] if (debug and "stride_debug" in debug) else []
+            force_print(f"[DEBUG] Stride {sid} not found for {participant} {test} {side}. Example ids: {avail}")
 
     # Stride matching (IMU-only -> GT converted to IMU time)
     gate_use = float(gate_s)
@@ -2877,7 +3062,7 @@ def run_pipeline_for_row_report(
             frac=0.12,
             min_gate=0.08,
             max_gate=0.25,
-            use="ic2ic",
+            use=STRIDE_CLOCK,
         )
 
     mapping_df, match_sum = match_strides_by_mid_swing_dp(
@@ -2921,18 +3106,10 @@ def run_pipeline_for_row_report(
             debug=debug,
             verbose=False,
             quiet=True,
-            events_imu=None,
+            events_imu=events_imu,
             plot_worst_k=0,
             stride_errors_path=stride_errors_path,
         )
-
-        if test == DEBUG_TEST and DEBUG_STRIDE_ID is not None:
-            if DEBUG_STRIDE_ID in debug["stride_debug"]:
-                print(f"\n[DEBUG] Plotting stride {DEBUG_STRIDE_ID} for {test}")
-                plot_one_stride_clearance(int(DEBUG_STRIDE_ID), debug)
-            else:
-                print(f"[DEBUG] Stride {DEBUG_STRIDE_ID} not found in debug for {test}")
-
 
         mtc_bias_mm = float(bias * 1000.0)
         mtc_rmse_mm = float(rmse * 1000.0)
@@ -2953,8 +3130,9 @@ def run_pipeline_for_row_report(
         "imu_sensor": sensor,
         "toe_marker": toe_marker,
         "toe_x_cm": float(toe_x_cm),
+        "toe_y_cm": float(toe_y_cm),
         "toe_z_cm": float(toe_z_cm),
-        "toe_offset_m": str([float(toe_x_cm)/100.0, 0.0, float(toe_z_cm)/100.0]),
+        "toe_offset_m": str([float(toe_x_cm)/100.0, float(toe_y_cm)/100.0, float(toe_z_cm)/100.0]),
         "phase_objective": str(phase_cfg),
 
         # IMU-only Events block
@@ -2987,4 +3165,7 @@ def run_pipeline_for_row_report(
         "mtc_mean_abs_diff_mm": float(extra["mtc_mean_abs_diff_m"]) * 1000.0,
 
     }
+    if return_debug:
+        return row, debug
     return row
+
