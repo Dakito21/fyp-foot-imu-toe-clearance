@@ -1,0 +1,330 @@
+{
+  "created_utc": "2026-05-02T14:28:01Z",
+  "device_name": "XIAO_BATTERY",
+  "record_seconds_per_face": 10,
+  "drop_first_seconds_for_detection": 1.0,
+  "face_definition": {
+    "Front": "toe-side face",
+    "Back": "heel-side face",
+    "Top": "top face",
+    "Bottom": "bottom face",
+    "Left": "left side face",
+    "Right": "right side face"
+  },
+  "results": [
+    {
+      "face": "Front",
+      "face_description": "toe-side face",
+      "csv_path": "imu_face_calibration\\Front_x_plus_20260502_222256.csv",
+      "detected_axis_direction": "x_plus",
+      "detected_axis": "x",
+      "detected_direction": "plus",
+      "detection": {
+        "axis": "x",
+        "direction": "plus",
+        "axis_direction": "x_plus",
+        "mean_accel_g": {
+          "ax": 1.023856843267108,
+          "ay": -0.09212394591611478,
+          "az": 0.0035414845474613685
+        },
+        "std_accel_g": {
+          "ax": 0.0019219340387205423,
+          "ay": 0.0017058845576635524,
+          "az": 0.002454368524035571
+        },
+        "norm_g": {
+          "mean": 1.0280034796374198,
+          "std": 0.001915133096668751
+        },
+        "dominant_abs_g": 1.023856843267108,
+        "second_abs_g": 0.09212394591611478,
+        "dominance_margin_g": 0.9317328973509933,
+        "samples_total": 2013,
+        "samples_used": 1812,
+        "seq_min": 0,
+        "seq_max": 2012,
+        "missing_seq_count": 0,
+        "missing_seq_ranges": "none",
+        "duplicate_seq_count": 0,
+        "out_of_order_count": 0,
+        "quality_pass": true,
+        "quality_flags": []
+      },
+      "transport": {
+        "xiao_reported_samples": 2013,
+        "python_saved_unique_samples": 2013,
+        "bad_line_count": 0,
+        "ack_count": 101,
+        "nack_count": 1,
+        "chunk_tx_count": 102,
+        "duplicates_seen": 0,
+        "out_of_order_count": 0,
+        "stream_stopped_line": "STREAM_STOPPED,2013 samples,missed=0,read_failures=0"
+      }
+    },
+    {
+      "face": "Back",
+      "face_description": "heel-side face",
+      "csv_path": "imu_face_calibration\\Back_x_minus_20260502_222358.csv",
+      "detected_axis_direction": "x_minus",
+      "detected_axis": "x",
+      "detected_direction": "minus",
+      "detection": {
+        "axis": "x",
+        "direction": "minus",
+        "axis_direction": "x_minus",
+        "mean_accel_g": {
+          "ax": -0.9693186744315029,
+          "ay": -0.10076870216306157,
+          "az": -0.005592301719356627
+        },
+        "std_accel_g": {
+          "ax": 0.0017447523241210128,
+          "ay": 0.0016417576331497008,
+          "az": 0.002491507389526863
+        },
+        "norm_g": {
+          "mean": 0.9745630640813097,
+          "std": 0.0017533171025930201
+        },
+        "dominant_abs_g": 0.9693186744315029,
+        "second_abs_g": 0.10076870216306157,
+        "dominance_margin_g": 0.8685499722684413,
+        "samples_total": 2004,
+        "samples_used": 1803,
+        "seq_min": 0,
+        "seq_max": 2003,
+        "missing_seq_count": 0,
+        "missing_seq_ranges": "none",
+        "duplicate_seq_count": 0,
+        "out_of_order_count": 0,
+        "quality_pass": true,
+        "quality_flags": []
+      },
+      "transport": {
+        "xiao_reported_samples": 2004,
+        "python_saved_unique_samples": 2004,
+        "bad_line_count": 0,
+        "ack_count": 101,
+        "nack_count": 4,
+        "chunk_tx_count": 105,
+        "duplicates_seen": 0,
+        "out_of_order_count": 0,
+        "stream_stopped_line": "STREAM_STOPPED,2004 samples,missed=0,read_failures=0"
+      }
+    },
+    {
+      "face": "Top",
+      "face_description": "top face",
+      "csv_path": "imu_face_calibration\\Top_z_plus_20260502_222509.csv",
+      "detected_axis_direction": "z_plus",
+      "detected_axis": "z",
+      "detected_direction": "plus",
+      "detection": {
+        "axis": "z",
+        "direction": "plus",
+        "axis_direction": "z_plus",
+        "mean_accel_g": {
+          "ax": 0.03377158852730281,
+          "ay": -0.13724939327082183,
+          "az": 1.0016223221180365
+        },
+        "std_accel_g": {
+          "ax": 0.0018749410623616072,
+          "ay": 0.001528699928938359,
+          "az": 0.002286495207357496
+        },
+        "norm_g": {
+          "mean": 1.011548870661295,
+          "std": 0.002269733804428849
+        },
+        "dominant_abs_g": 1.0016223221180365,
+        "second_abs_g": 0.13724939327082183,
+        "dominance_margin_g": 0.8643729288472146,
+        "samples_total": 2013,
+        "samples_used": 1813,
+        "seq_min": 0,
+        "seq_max": 2012,
+        "missing_seq_count": 0,
+        "missing_seq_ranges": "none",
+        "duplicate_seq_count": 0,
+        "out_of_order_count": 0,
+        "quality_pass": true,
+        "quality_flags": []
+      },
+      "transport": {
+        "xiao_reported_samples": 2013,
+        "python_saved_unique_samples": 2013,
+        "bad_line_count": 0,
+        "ack_count": 101,
+        "nack_count": 2,
+        "chunk_tx_count": 103,
+        "duplicates_seen": 0,
+        "out_of_order_count": 0,
+        "stream_stopped_line": "STREAM_STOPPED,2013 samples,missed=0,read_failures=0"
+      }
+    },
+    {
+      "face": "Bottom",
+      "face_description": "bottom face",
+      "csv_path": "imu_face_calibration\\Bottom_z_minus_20260502_222603.csv",
+      "detected_axis_direction": "z_minus",
+      "detected_axis": "z",
+      "detected_direction": "minus",
+      "detection": {
+        "axis": "z",
+        "direction": "minus",
+        "axis_direction": "z_minus",
+        "mean_accel_g": {
+          "ax": 0.014790338325013863,
+          "ay": -0.0636895951192457,
+          "az": -1.0221589406544647
+        },
+        "std_accel_g": {
+          "ax": 0.0021901437844768163,
+          "ay": 0.0030557458481305084,
+          "az": 0.004533883586452066
+        },
+        "norm_g": {
+          "mean": 1.024255129452142,
+          "std": 0.004486727388420531
+        },
+        "dominant_abs_g": 1.0221589406544647,
+        "second_abs_g": 0.0636895951192457,
+        "dominance_margin_g": 0.958469345535219,
+        "samples_total": 2004,
+        "samples_used": 1803,
+        "seq_min": 0,
+        "seq_max": 2003,
+        "missing_seq_count": 0,
+        "missing_seq_ranges": "none",
+        "duplicate_seq_count": 0,
+        "out_of_order_count": 0,
+        "quality_pass": true,
+        "quality_flags": []
+      },
+      "transport": {
+        "xiao_reported_samples": 2004,
+        "python_saved_unique_samples": 2004,
+        "bad_line_count": 0,
+        "ack_count": 101,
+        "nack_count": 0,
+        "chunk_tx_count": 101,
+        "duplicates_seen": 0,
+        "out_of_order_count": 0,
+        "stream_stopped_line": "STREAM_STOPPED,2004 samples,missed=0,read_failures=0"
+      }
+    },
+    {
+      "face": "Left",
+      "face_description": "left side face",
+      "csv_path": "imu_face_calibration\\Left_y_plus_20260502_222707.csv",
+      "detected_axis_direction": "y_plus",
+      "detected_axis": "y",
+      "detected_direction": "plus",
+      "detection": {
+        "axis": "y",
+        "direction": "plus",
+        "axis_direction": "y_plus",
+        "mean_accel_g": {
+          "ax": 0.022804724233983286,
+          "ay": 0.8971489303621171,
+          "az": 0.027182311977715878
+        },
+        "std_accel_g": {
+          "ax": 0.0017159877333643026,
+          "ay": 0.0016954947427474084,
+          "az": 0.0024375859022444275
+        },
+        "norm_g": {
+          "mean": 0.8978552220796405,
+          "std": 0.0017009312245901671
+        },
+        "dominant_abs_g": 0.8971489303621171,
+        "second_abs_g": 0.027182311977715878,
+        "dominance_margin_g": 0.8699666183844011,
+        "samples_total": 1995,
+        "samples_used": 1795,
+        "seq_min": 0,
+        "seq_max": 1994,
+        "missing_seq_count": 0,
+        "missing_seq_ranges": "none",
+        "duplicate_seq_count": 0,
+        "out_of_order_count": 0,
+        "quality_pass": false,
+        "quality_flags": [
+          "Acceleration norm mean 0.8979 g is far from 1 g."
+        ]
+      },
+      "transport": {
+        "xiao_reported_samples": 1995,
+        "python_saved_unique_samples": 1995,
+        "bad_line_count": 0,
+        "ack_count": 100,
+        "nack_count": 2,
+        "chunk_tx_count": 102,
+        "duplicates_seen": 0,
+        "out_of_order_count": 0,
+        "stream_stopped_line": "STREAM_STOPPED,1995 samples,missed=0,read_failures=0"
+      }
+    },
+    {
+      "face": "Right",
+      "face_description": "right side face",
+      "csv_path": "imu_face_calibration\\Right_y_minus_20260502_222800.csv",
+      "detected_axis_direction": "y_minus",
+      "detected_axis": "y",
+      "detected_direction": "minus",
+      "detection": {
+        "axis": "y",
+        "direction": "minus",
+        "axis_direction": "y_minus",
+        "mean_accel_g": {
+          "ax": 0.013060221852468107,
+          "ay": -1.0913908097615086,
+          "az": -0.040875363283416524
+        },
+        "std_accel_g": {
+          "ax": 0.0018875933669065712,
+          "ay": 0.002528645566410252,
+          "az": 0.0029341685124797856
+        },
+        "norm_g": {
+          "mean": 1.0922396259605411,
+          "std": 0.0025344622688804014
+        },
+        "dominant_abs_g": 1.0913908097615086,
+        "second_abs_g": 0.040875363283416524,
+        "dominance_margin_g": 1.0505154464780921,
+        "samples_total": 2004,
+        "samples_used": 1803,
+        "seq_min": 0,
+        "seq_max": 2003,
+        "missing_seq_count": 0,
+        "missing_seq_ranges": "none",
+        "duplicate_seq_count": 0,
+        "out_of_order_count": 0,
+        "quality_pass": false,
+        "quality_flags": [
+          "Acceleration norm mean 1.0922 g is far from 1 g."
+        ]
+      },
+      "transport": {
+        "xiao_reported_samples": 2004,
+        "python_saved_unique_samples": 2004,
+        "bad_line_count": 0,
+        "ack_count": 101,
+        "nack_count": 1,
+        "chunk_tx_count": 102,
+        "duplicates_seen": 0,
+        "out_of_order_count": 0,
+        "stream_stopped_line": "STREAM_STOPPED,2004 samples,missed=0,read_failures=0"
+      }
+    }
+  ],
+  "overall_quality": {
+    "pass": false,
+    "warnings": []
+  }
+}

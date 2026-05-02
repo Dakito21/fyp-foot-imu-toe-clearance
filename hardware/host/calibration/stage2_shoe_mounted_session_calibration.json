@@ -1,0 +1,65 @@
+{
+  "stage": "stage2_record_then_calibrate_shoe_mounted_gyro_bias_and_gravity_reference",
+  "created_utc": "2026-05-02T14:52:23Z",
+  "source_csv": "imu_stage2\\shoe_flat_still_20260502_225223.csv",
+  "stage1_accel_calibration_used": "stage1_container_accel_calibration.json",
+  "usage_note": "Use gyro_bias_dps to correct walking trials. Do not subtract accel_static_mean_g from walking data; it contains gravity.",
+  "recording_validation": {
+    "path": "imu_stage2\\shoe_flat_still_20260502_225223.csv",
+    "rows": 3999,
+    "seq_min": 0,
+    "seq_max": 3998,
+    "missing_seq_count": 0,
+    "missing_seq_ranges": "none",
+    "duplicate_seq_count": 0,
+    "out_of_order_count": 0,
+    "seq_pass": true
+  },
+  "processing": {
+    "drop_first_seconds": 1.0,
+    "samples_used": 3798,
+    "duration_s_after_trim": 18.985,
+    "effective_hz_after_trim": 200.0
+  },
+  "gyro_bias_dps": {
+    "gx": -0.42042204581358605,
+    "gy": 0.21291718536071613,
+    "gz": 0.27530510795155344
+  },
+  "gyro_noise_std_dps": {
+    "gx": 0.09080692535681682,
+    "gy": 0.09003848702791714,
+    "gz": 0.0689604438186749
+  },
+  "gyro_norm_stats_dps": {
+    "mean": 0.5591489024889048,
+    "std": 0.0796135194828325,
+    "max": 0.862323790753798
+  },
+  "accel_static_mean_g": {
+    "ax": -0.3782533410678104,
+    "ay": 0.015546786258474568,
+    "az": 0.921879968274614
+  },
+  "accel_noise_std_g": {
+    "ax": 0.002219081543240156,
+    "ay": 0.001717687100108623,
+    "az": 0.002461168455451641
+  },
+  "accel_norm_stats_g": {
+    "mean": 0.9965885158051985,
+    "std": 0.002286589933530122,
+    "min": 0.9878757583437633,
+    "max": 1.004050363998647,
+    "norm_of_mean_vector": 0.9965841502341543
+  },
+  "mounted_gravity_unit_vector_sensor_frame": {
+    "x": -0.3795498262529433,
+    "y": 0.015600073766798062,
+    "z": 0.9250397651397647
+  },
+  "quality": {
+    "pass": true,
+    "flags": []
+  }
+}
