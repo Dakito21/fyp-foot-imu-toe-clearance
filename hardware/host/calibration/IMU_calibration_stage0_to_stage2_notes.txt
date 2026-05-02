@@ -1,0 +1,127 @@
+IMU CALIBRATION PIPELINE NOTES — STAGE 0 TO STAGE 2
+
+Firmware used for all recording:
+- GyroAndAccel_XIAO_RAM_100Hz_CSV_DUMP_ACK.ino
+- Same Arduino firmware is used for Stage 0, Stage 2, and walking trials.
+
+Main rule:
+- Stage 0 and Stage 1 are for the container/sensor calibration.
+- Stage 2 is for the shoe-mounted session calibration.
+- Redo Stage 2 whenever the casing is removed, repositioned, re-strapped, or mounted on a different shoe.
+
+
+STAGE 0 — Face auto-axis detector
+Purpose:
+- Identify which physical casing face corresponds to x_plus, x_minus, y_plus, y_minus, z_plus, z_minus.
+
+When to run:
+- After the BMI160 is fixed inside the casing/container.
+- Run again if the board position inside the casing changes.
+
+How to run:
+python stage0_face_auto_axis_detector_ROBUST.py
+
+What to do:
+- Follow the prompts for Front, Back, Top, Bottom, Left, Right.
+- Keep the casing completely still for each face recording.
+- The script auto-renames files like:
+  Front_x_plus.csv
+  Back_x_minus.csv
+  Top_z_plus.csv
+
+Good result:
+- Each face saves a clean CSV.
+- No missing sequence values.
+- You get one file for each:
+  x_plus, x_minus, y_plus, y_minus, z_plus, z_minus.
+
+
+STAGE 1 — Container accelerometer calibration
+Purpose:
+- Calculate accelerometer offset and scale correction for the sensor inside the casing.
+- Uses the six files from Stage 0.
+
+When to run:
+- After Stage 0.
+- Run once for the casing setup.
+- Redo only if the sensor board moves inside the casing.
+
+How to run:
+python stage1_container_accel_calibration.py six ^
+  --x-plus imu_face_calibration\Front_x_plus.csv ^
+  --x-minus imu_face_calibration\Back_x_minus.csv ^
+  --y-plus imu_face_calibration\Left_y_plus.csv ^
+  --y-minus imu_face_calibration\Right_y_minus.csv ^
+  --z-plus imu_face_calibration\Top_z_plus.csv ^
+  --z-minus imu_face_calibration\Bottom_z_minus.csv ^
+  --out stage1_container_accel_calibration.json
+
+Important:
+- Use the axis label in the filename, not the face name.
+- Example: a file ending in _x_plus.csv goes to --x-plus.
+
+Good result:
+- Quality: PASS
+- Output file:
+  stage1_container_accel_calibration.json
+
+Current Stage 1 result:
+- ax offset = 0.061630 g
+- ay offset = -0.057616 g
+- az offset = 0.019411 g
+- ax scale = 1.002410
+- ay scale = 1.005592
+- az scale = 0.988756
+
+
+STAGE 2 — Shoe-mounted gyro calibration
+Purpose:
+- Calculate gyroscope zero-rate bias after the casing is mounted on the shoe.
+- Also records the mounted gravity direction.
+
+When to run:
+- After the casing is mounted on the shoe exactly like the walking setup.
+- Run before walking trials.
+- Redo if the casing is moved, removed, re-strapped, or shoe changes.
+
+Condition:
+- Shoe flat on the floor.
+- Completely still.
+- Do NOT walk during Stage 2.
+
+How to run:
+python stage2_shoe_gyro_calibration.py --stage1-accel-calib stage1_container_accel_calibration.json
+
+Good result:
+- Quality: PASS
+- Output file:
+  stage2_shoe_mounted_session_calibration.json
+
+Current Stage 2 result:
+- gx bias = -0.404765 dps
+- gy bias = 0.241896 dps
+- gz bias = 0.235968 dps
+- mounted gravity vector = [-0.440821, -0.005699, 0.897577]
+- accel norm = 0.999893 g
+
+
+AFTER STAGE 2 — Walking trials
+Before walking:
+- Keep the same casing position and same strap/lace tightness.
+- Do not move the casing after Stage 2.
+
+Use calibration:
+- Apply Stage 1 accelerometer correction.
+- Apply Stage 2 gyroscope bias correction.
+
+Acceptance rule:
+- Only accept recordings where:
+  SEQ CHECK = PASS
+  missed = 0
+  read_failures = 0
+  bad/clipped lines = 0
+
+Quick memory:
+- Stage 0 = find casing face to sensor axis.
+- Stage 1 = calibrate accelerometer inside casing.
+- Stage 2 = calibrate gyro after mounting on shoe.
