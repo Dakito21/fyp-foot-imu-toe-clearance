@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# joblib cache created by the SPC2019 loader
+cache/
+
+# Arduino build output
+build/
+
+# SPC2019 dataset (download separately)
+sensorpositoncomparison*/
+
+*.zip
+.DS_Store
+Thumbs.db
