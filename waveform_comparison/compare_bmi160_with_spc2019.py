@@ -64,7 +64,7 @@ Outputs:
 Example:
     python compare_bmi160_with_sensorposition_dataset_v2.py ^
       --data_folder "path/to/sensorpositoncomparison-v1.0.0-beta" ^
-      --core_dir "path/to/foot-imu-mtc/algorithm" ^
+      --core_dir "path/to/fyp-foot-imu-toe-clearance/algorithm" ^
       --my_csv "imu_recordings\\imu_20260502_191304_RAW.csv"
 
 """
