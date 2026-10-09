@@ -1,0 +1,69 @@
+<mxfile host="app.diagrams.net" agent="ChatGPT">
+  <diagram id="aca204e4a4f64219" name="BMI160 Waveform Verification">
+    <mxGraphModel grid="1" page="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="box5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=3;fillColor=#DDF3E8;strokeColor=#40966F;" vertex="1">
+          <mxGeometry height="155" width="290" x="1092" y="275" as="geometry" />
+        </mxCell>
+        <mxCell id="box1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=3;fillColor=#E7F1F8;strokeColor=#1E5E95;" vertex="1">
+          <mxGeometry height="155" width="290" x="70" y="275" as="geometry" />
+        </mxCell>
+        <mxCell id="box1_circle" parent="1" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;strokeColor=#0F2E52;fillColor=#0F2E52;fontFamily=Arial;fontSize=17;fontStyle=1;fontColor=#FFFFFF;align=center;verticalAlign=middle;" value="1" vertex="1">
+          <mxGeometry height="42" width="42" x="84" y="293" as="geometry" />
+        </mxCell>
+        <mxCell id="box1_header" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Arial;fontSize=22;fontStyle=1;fontColor=#0F2E52;whiteSpace=wrap;" value="BMI160 + SPC2019 waveforms" vertex="1">
+          <mxGeometry height="32" width="218" x="142" y="298" as="geometry" />
+        </mxCell>
+        <mxCell id="box1_body" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=top;fontFamily=Arial;fontSize=17;fontColor=#0F2E52;whiteSpace=wrap;" value="&lt;font style=&quot;font-size: 18px;&quot;&gt;Speed-matched instep signals&lt;/font&gt;" vertex="1">
+          <mxGeometry height="50" width="233" x="98.5" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="box2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=3;fillColor=#E7F1F8;strokeColor=#1E5E95;" vertex="1">
+          <mxGeometry height="155" width="290" x="410" y="275" as="geometry" />
+        </mxCell>
+        <mxCell id="box2_circle" parent="1" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;strokeColor=#0F2E52;fillColor=#0F2E52;fontFamily=Arial;fontSize=17;fontStyle=1;fontColor=#FFFFFF;align=center;verticalAlign=middle;" value="2" vertex="1">
+          <mxGeometry height="42" width="42" x="424" y="293" as="geometry" />
+        </mxCell>
+        <mxCell id="box2_header" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontFamily=Arial;fontSize=22;fontStyle=1;fontColor=#0F2E52;whiteSpace=wrap;" value="Standardize signals" vertex="1">
+          <mxGeometry height="32" width="218" x="482" y="295" as="geometry" />
+        </mxCell>
+        <mxCell id="box2_body" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=top;fontFamily=Arial;fontSize=17;fontColor=#0F2E52;whiteSpace=wrap;" value="&lt;font style=&quot;font-size: 18px;&quot;&gt;Filter, resample and normalize&lt;/font&gt;" vertex="1">
+          <mxGeometry height="50" width="215" x="447.5" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="box3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeWidth=3;fillColor=#E7F1F8;strokeColor=#1E5E95;" vertex="1">
+          <mxGeometry height="155" width="290" x="750" y="275" as="geometry" />
+        </mxCell>
+        <mxCell id="box3_circle" parent="1" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;strokeColor=#0F2E52;fillColor=#0F2E52;fontFamily=Arial;fontSize=17;fontStyle=1;fontColor=#FFFFFF;align=center;verticalAlign=middle;" value="3" vertex="1">
+          <mxGeometry height="42" width="42" x="764" y="293" as="geometry" />
+        </mxCell>
+        <mxCell id="box3_header" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Arial;fontSize=22;fontStyle=1;fontColor=#0F2E52;whiteSpace=wrap;" value="Align and compare waveforms" vertex="1">
+          <mxGeometry height="32" width="208" x="822" y="295" as="geometry" />
+        </mxCell>
+        <mxCell id="box3_body" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=top;fontFamily=Arial;fontSize=17;fontColor=#0F2E52;whiteSpace=wrap;" value="&lt;font style=&quot;font-size: 18px;&quot;&gt;Pearson correlation, nRMSE and DTW&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="250" x="770" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="box4_circle" parent="1" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;strokeColor=#0F2E52;fillColor=#0F2E52;fontFamily=Arial;fontSize=17;fontStyle=1;fontColor=#FFFFFF;align=center;verticalAlign=middle;" value="4" vertex="1">
+          <mxGeometry height="42" width="42" x="1106" y="293" as="geometry" />
+        </mxCell>
+        <mxCell id="box4_header" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Arial;fontSize=22;fontStyle=1;fontColor=#0F2E52;whiteSpace=wrap;" value="Signal-plausibility output" vertex="1">
+          <mxGeometry height="32" width="198" x="1166" y="298" as="geometry" />
+        </mxCell>
+        <mxCell id="box4_body" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=top;fontFamily=Arial;fontSize=17;fontColor=#0F2E52;whiteSpace=wrap;" value="&lt;font style=&quot;font-size: 18px;&quot;&gt;Check repeatable peaks and speed-responsive rhythm&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="250" x="1112" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="edge1" edge="1" parent="1" source="box1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=4;strokeColor=#1E5E95;endArrow=block;endFill=1;" target="box2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge2" edge="1" parent="1" source="box2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=4;strokeColor=#1E5E95;endArrow=block;endFill=1;" target="box3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge3" edge="1" parent="1" source="box3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=4;strokeColor=#1E5E95;endArrow=block;endFill=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="box5">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1070" y="392.5" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

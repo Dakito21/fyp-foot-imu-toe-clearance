@@ -7,6 +7,8 @@ Minimum toe clearance (MTC) is the smallest gap between the toe and the ground d
 
 📄 **Paper:** [paper/FYP_Final_Paper.pdf](paper/FYP_Final_Paper.pdf)
 
+![System overview: SPC2019 algorithm validation branch and BMI160 waveform verification branch](docs/figures/system_overview.png)
+
 ## Results
 
 The algorithm was validated against synchronised MoCap from the [SensorPositionComparison2019](https://mad-lab-fau.github.io/gaitmap-datasets/auto_examples/sensor_position_comparison_2019.html) dataset, using participant-held-out gait-event detection on 12 participants and all 7 walking trials.
@@ -28,6 +30,24 @@ The algorithm was validated against synchronised MoCap from the [SensorPositionC
 5. **Virtual toe:** the IMU-to-toe offset is calibrated against MoCap, and MTC is taken as the minimum of toe height above a ground level estimated from stance.
 6. **Validation:** monotone dynamic-programming stride matching against MoCap, reporting bias, MAE, RMSE and Pearson r.
 
+**Stage A: gait-event detection**
+
+![EventNet gait-event detection pipeline](docs/figures/eventnet_gait_event_detection.png)
+
+**Stage B: MTC estimation**
+
+![IMU-based MTC estimation pipeline](docs/figures/mtc_estimation_pipeline.png)
+
+**BMI160 prototype: waveform verification**
+
+![BMI160 waveform verification pipeline](docs/figures/bmi160_waveform_verification.png)
+
+## Hardware
+
+The wearable uses a BMI160 6-axis IMU on I²C with a Seeed Studio XIAO nRF52840 Sense, powered by a 3.7 V LiPo through a slide switch. Data is recorded to RAM at 200 Hz and sent to a host PC over BLE in acknowledged chunks. The 3D-printed enclosure went through seven design iterations ([`hardware/enclosure_cad/`](hardware/enclosure_cad/)).
+
+![BMI160 / XIAO nRF52840 schematic](docs/figures/bmi160_xiao_schematic.png)
+
 ## Repository layout
 
 | Path | Contents |
@@ -46,10 +66,13 @@ The algorithm was validated against synchronised MoCap from the [SensorPositionC
 | [`waveform_comparison/`](waveform_comparison/) | Comparison of BMI160 and SPC2019 waveforms; `plots/` is v2 (gaitmap frame), `plots_v1/` is the first version |
 | [`data/bmi160_recordings/`](data/bmi160_recordings/) | Raw and calibrated walking recordings from the custom device |
 | [`results/`](results/) | Per-trial summaries, toe-offset calibrations and stride-level error exports |
+| [`docs/`](docs/) | Pipeline, system and circuit diagrams (`figures/` PNG exports, `diagrams_source/` editable draw.io files) |
 
 The SPC2019 dataset is not included. Download it from the link above and pass its folder as `--data_folder`.
 
 ## Running
+
+Developed with Python 3.10; `requirements.txt` pins the versions from the original environment.
 
 ```bash
 pip install -r requirements.txt

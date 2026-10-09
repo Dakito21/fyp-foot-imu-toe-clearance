@@ -1,9 +1,13 @@
-numpy
-pandas
-scipy
-matplotlib
-torch
-joblib
-ahrs
-gaitmap-datasets
-bleak
+# Python 3.10.11 — versions from the original project environment (ENG4701_env)
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
+matplotlib==3.10.8
+scikit-learn==1.7.2
+joblib==1.5.3
+ahrs==0.4.0
+gaitmap-datasets==0.14.0
+# the original environment used the CUDA 12.1 build (2.5.1+cu121); the CPU build also works
+torch==2.5.1
+# BLE host logger only
+bleak==3.0.1
